@@ -169,9 +169,20 @@ impl Video {
     }
 }
 
-/// One entry of `bitrateInfo`, if its codec plays everywhere (H.264, H.265;
-/// not ByteDance's own `bytevc2`) and it has an address on TikTok's hosts.
+/// One entry of `bitrateInfo`, if it plays on its own with its sound and
+/// everywhere: a whole MP4 (`Format` `mp4`, or none given), not `dash`,
+/// which long videos' H.265 renditions are, with the picture only and the
+/// sound apart in `bitrateAudioInfo` (probed with mpv: no audio track, so
+/// they played silent); H.264 or H.265, not ByteDance's own `bytevc2`; and
+/// an address on TikTok's hosts.
 fn rendition(entry: &Value) -> Option<Rendition> {
+    if entry
+        .get("Format")
+        .and_then(Value::as_str)
+        .is_some_and(|f| f != "mp4")
+    {
+        return None;
+    }
     let codec = match entry.get("CodecType")?.as_str()? {
         "h264" => Codec::H264,
         kind if kind.starts_with("h265") => Codec::H265,
@@ -307,6 +318,27 @@ mod tests {
         ]);
         let wide = Video::parse(&wide).unwrap();
         assert_eq!(wide.best((608, 1080)).map(|r| r.width), Some(960));
+    }
+
+    #[test]
+    fn picture_only_renditions_are_left_out() {
+        // A long video: its H.265 renditions are DASH, the picture only,
+        // with the sound apart; its H.264 one is a whole MP4.
+        let mut long = item();
+        long["video"]["bitrateInfo"] = json!([
+            {"CodecType": "h265_hvc1", "Format": "dash", "PlayAddr": {"Width": 1024, "Height": 576, "DataSize": 42_410_958, "UrlList": [V16]}},
+            {"CodecType": "h264", "Format": "mp4", "PlayAddr": {"Width": 1024, "Height": 576, "DataSize": 68_733_864, "UrlList": [V16]}},
+        ]);
+        let video = Video::parse(&long).unwrap();
+        assert_eq!(video.renditions.len(), 1);
+        assert_eq!(video.best((608, 1080)).map(|r| r.codec), Some(Codec::H264));
+        // Only DASH: the default address, which has its sound.
+        long["video"]["bitrateInfo"] = json!([
+            {"CodecType": "h265_hvc1", "Format": "dash", "PlayAddr": {"Width": 1024, "Height": 576, "UrlList": [V16]}},
+        ]);
+        let video = Video::parse(&long).unwrap();
+        assert_eq!(video.renditions.len(), 1);
+        assert_eq!(video.renditions[0].codec, Codec::H264);
     }
 
     #[test]
