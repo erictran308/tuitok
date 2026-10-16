@@ -11,6 +11,7 @@ mod config;
 mod covers;
 mod demo;
 mod feed;
+mod guest;
 mod pepper;
 mod player;
 mod text;
@@ -28,12 +29,14 @@ use browser::Engine;
 const HELP: &str = "\
 tuitok: TikTok's For You feed in the terminal, playing inside Pepper
 
-Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --help | --version]
+Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --forget | --help | --version]
 
   --check     say what tuitok found: Pepper, its player, a browser for the feed
   --feed      fetch one batch of the feed and list it: with Lightpanda, else
-              Chrome, or with the one named
+              Chrome, or with the one named (as a new guest)
   --demo      the screen with made-up videos: nothing is fetched or played
+  --forget    forget the last run's guest and the videos you watched, so the
+              next run starts over as a new guest
   --help      print this
   --version   print tuitok's version
 
@@ -70,6 +73,7 @@ fn main() -> ExitCode {
         }
         ["--feed"] => list_feed(None),
         ["--demo"] => run_demo(),
+        ["--forget"] => forget_guest(),
         ["--feed", name] if Engine::parse(name).is_some() => list_feed(Engine::parse(name)),
         ["--help" | "-h"] => {
             println!("{HELP}");
@@ -117,6 +121,9 @@ fn run() -> ExitCode {
     };
     let engines = feed::engines(&tools, None);
     let mut app = app::App::new(port.is_some(), engines, &session, player_with);
+    // The last run's guest: the same TikTok guest goes on, and what was
+    // watched isn't shown again.
+    app.carry_in(guest::load(&session.data));
     let mut terminal = ratatui::init();
     start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));
@@ -125,6 +132,12 @@ fn run() -> ExitCode {
     // A batch still being fetched and the downloads end here, the browser
     // killed (`Browser`'s `Drop`), before the session's folder goes.
     drop(runtime);
+    if let Err(e) = guest::save(&session.data, &app.carry_out()) {
+        eprintln!(
+            "tuitok: couldn't keep the guest for next time: {}",
+            text::one_line(&format!("{e:#}"), 300)
+        );
+    }
     session.end();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -187,6 +200,29 @@ fn check() {
     println!("Lightpanda:  {}", found(&tools.lightpanda));
     println!("Chrome:      {}", found(&tools.chrome));
     println!("mpv:         {}", found(&tools.mpv));
+    let last = config::data_dir_path()
+        .map(|data| guest::load(&data))
+        .unwrap_or_default();
+    if last == guest::Guest::default() {
+        println!("Last guest:  none: the next run starts as a new guest");
+    } else {
+        println!(
+            "Last guest:  {} cookies, {} videos watched (tuitok --forget starts over)",
+            last.cookies.len(),
+            last.watched.len()
+        );
+    }
+}
+
+/// `--forget`: deletes the last run's guest.
+fn forget_guest() -> ExitCode {
+    let forgot = config::data_dir().and_then(|data| guest::forget(&data));
+    match forgot {
+        Ok(true) => println!("Forgot the last guest and the videos you watched."),
+        Ok(false) => println!("Nothing to forget: no guest was kept."),
+        Err(e) => return fail(&e),
+    }
+    ExitCode::SUCCESS
 }
 
 /// `--feed`: one batch, listed. Never the cookie itself.

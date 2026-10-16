@@ -139,6 +139,10 @@ pub struct App {
     profile: PathBuf,
     cache: PathBuf,
     seen: HashSet<VideoId>,
+    /// What the last run's guest watched (`guest.rs`), and the furthest
+    /// video shown in this run: handed to the next run.
+    watched_before: Vec<VideoId>,
+    furthest: usize,
     fetching: bool,
     /// Where the batch being fetched starts in `videos`, and how many it
     /// asks for.
@@ -221,6 +225,8 @@ impl App {
             profile: session.profile.clone(),
             cache: session.cache.clone(),
             seen: HashSet::new(),
+            watched_before: Vec::new(),
+            furthest: 0,
             fetching: false,
             batch_from: 0,
             batch_size: feed::batch_size(0),
@@ -334,6 +340,7 @@ impl App {
     /// fetched, downloaded or played.
     pub fn demo(pepper: bool) -> Self {
         let nowhere = Session {
+            data: PathBuf::new(),
             dir: PathBuf::new(),
             profile: PathBuf::new(),
             cache: PathBuf::new(),
@@ -362,6 +369,27 @@ impl App {
             note: None,
         }));
         app
+    }
+
+    /// Goes on from the last run's guest: its cookies for the first batch,
+    /// and what it watched is skipped if TikTok sends it again.
+    pub fn carry_in(&mut self, guest: crate::guest::Guest) {
+        self.cookies = guest.cookies;
+        self.seen.extend(guest.watched.iter().cloned());
+        self.watched_before = guest.watched;
+    }
+
+    /// The guest to hand the next run: the cookies of the last batch (or
+    /// the last run's, if none came), and what was watched, this run's
+    /// after the last run's.
+    pub fn carry_out(&self) -> crate::guest::Guest {
+        let shown = self.videos.len().min(self.furthest + 1);
+        let mut watched = self.watched_before.clone();
+        watched.extend(self.videos[..shown].iter().map(|v| v.id.clone()));
+        crate::guest::Guest {
+            cookies: self.cookies.clone(),
+            watched,
+        }
     }
 
     /// How many videos the batch being fetched has added so far.
@@ -944,6 +972,7 @@ impl App {
             return;
         }
         self.at = self.at.saturating_add_signed(by).min(self.videos.len() - 1);
+        self.furthest = self.furthest.max(self.at);
         self.prune();
         self.prefetch();
         self.want_covers();
@@ -992,6 +1021,7 @@ pub mod tests {
 
     pub fn app_with(videos: Vec<Video>) -> App {
         let session = Session {
+            data: PathBuf::from("/nowhere"),
             dir: PathBuf::from("/nowhere"),
             profile: PathBuf::from("/nowhere/chrome"),
             cache: PathBuf::from("/nowhere/cache"),
@@ -1092,6 +1122,30 @@ pub mod tests {
         let ask = app.next_ask().unwrap();
         assert_eq!((app.batches, app.batch_size, ask.want), (4, 8, 8));
         assert_eq!(app.videos.len(), 11);
+    }
+
+    #[test]
+    fn the_last_runs_guest_goes_on_and_what_it_watched_is_skipped() {
+        let mut app = app_with(Vec::new());
+        app.batches = 0;
+        let cookie = serde_json::json!({"name": "ttwid", "value": "a", "domain": ".tiktok.com"});
+        app.carry_in(crate::guest::Guest {
+            cookies: vec![cookie.clone()],
+            watched: vec![VideoId::new("1").unwrap()],
+        });
+        let ask = app.next_ask().unwrap();
+        assert_eq!(ask.cookies, [cookie]);
+        assert!(ask.seen.contains(&VideoId::new("1").unwrap()));
+        // TikTok sends 1 again: it isn't shown.
+        app.on_app_event(AppEvent::Found(
+            ["1", "2", "3", "4"].map(crate::ui::tests::video).to_vec(),
+        ));
+        assert_eq!(app.videos.len(), 3);
+        app.go(1);
+        let out = app.carry_out();
+        let ids: Vec<&str> = out.watched.iter().map(VideoId::as_str).collect();
+        assert_eq!(ids, ["1", "2", "3"], "4 wasn't shown");
+        assert_eq!(out.cookies.len(), 1);
     }
 
     #[test]

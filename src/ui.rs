@@ -5,7 +5,7 @@
 //! the box shows its cover, with under it what plays and how it's going.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
@@ -35,34 +35,40 @@ fn behind(name: &str) -> String {
 /// Rows of text under the cover in the box.
 const TEXT_ROWS: u16 = 3;
 
-/// Where things go in a window: the video's box, the panel beside it (in
-/// wide windows), the bottom line. `App::box_pixels` lays it out the same.
+/// Where things go in a window: the box around the video's side (as
+/// tuitube's watch page has one), the video's box in it, the panel beside it
+/// (in wide windows), the bottom line. `App::box_pixels` lays it out the
+/// same.
 pub struct Areas {
+    pub stage: Option<Rect>,
     pub video: Rect,
     pub panel: Option<Rect>,
     pub bottom: Rect,
 }
 
-/// Lays out a window of `area`: with `fullscreen` (`f`, in Pepper) the
-/// video takes all but the bottom line, and there's no panel.
+/// Lays out a window of `area`: the video upright and centred in its side's
+/// box, as tall as it allows. With `fullscreen` (`f`, in Pepper) the video
+/// takes all but the bottom line, and there's no box or panel.
 pub fn areas(area: Rect, cell: (u16, u16), fullscreen: bool) -> Areas {
     let [main, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     if fullscreen {
         return Areas {
+            stage: None,
             video: main,
             panel: None,
             bottom,
         };
     }
-    let (video_side, panel) = if main.width >= PANEL_FROM {
-        let [video, panel] =
+    let (stage, panel) = if main.width >= PANEL_FROM {
+        let [stage, panel] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(PANEL)]).areas(main);
-        (video, Some(panel))
+        (stage, Some(panel))
     } else {
         (main, None)
     };
     Areas {
-        video: pepper::portrait_area(video_side, cell),
+        stage: Some(stage),
+        video: pepper::portrait_area(stage.inner(Margin::new(1, 1)), cell),
         panel,
         bottom,
     }
@@ -83,6 +89,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
     let areas = areas(area, app.cell, app.fullscreen);
+    if let Some(stage) = areas.stage {
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::from("▶").fg(c.accent),
+            Span::from(" For You ").fg(c.text).bold(),
+        ]);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(c.border))
+            .title(title);
+        frame.render_widget(block, stage);
+    }
     frame.render_widget(Block::new().style(Style::new().bg(c.panel)), areas.video);
     draw_in_box(frame, app, areas.video);
     if let Some(panel) = areas.panel {
@@ -583,14 +601,26 @@ pub mod tests {
         assert!(text.contains("@made.up.cat") && text.contains("1 of 6"));
         assert!(text.contains("0:05 / 0:14 · 1 of 6") && text.contains("━"));
         assert!(!text.contains("Waiting to download"));
+        // The video's side is boxed, as tuitube's watch page, with the
+        // video in it, under its title.
+        let laid = areas(Rect::new(0, 0, 120, 40), app.cell, false);
+        let stage = laid.stage.unwrap();
+        assert!(
+            stage
+                .inner(Margin::new(1, 1))
+                .contains(laid.video.as_position())
+        );
+        assert!(laid.video.right() < stage.right() && laid.video.bottom() < stage.bottom());
+        assert!(text.contains("╭ ▶ For You ─"));
         // f: the box takes all but the bottom line, and the panel goes.
         let filled = areas(Rect::new(0, 0, 120, 40), app.cell, true);
         assert_eq!(
-            (filled.video, filled.panel),
-            (Rect::new(0, 0, 120, 39), None)
+            (filled.stage, filled.video, filled.panel),
+            (None, Rect::new(0, 0, 120, 39), None)
         );
         app.fullscreen = true;
-        assert!(!screen(&app, 120, 40).contains("@made.up.cat"));
+        let text = screen(&app, 120, 40);
+        assert!(!text.contains("@made.up.cat") && !text.contains("For You"));
     }
 
     #[test]

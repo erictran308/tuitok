@@ -1,5 +1,5 @@
-//! Where tuitok keeps what it keeps (the Chrome profile now, the video cache
-//! next): `TUITOK_DATA_DIR`, else the platform's place for app data
+//! Where tuitok keeps what it keeps (each run's session folder, and
+//! `guest.json` between runs): `TUITOK_DATA_DIR`, else the platform's place for app data
 //! (`~/Library/Application Support/tuitok` on macOS,
 //! `~/.local/share/tuitok` on Linux), made readable only by you, as
 //! tuitube's `config.rs` does.
@@ -13,6 +13,11 @@ use crate::tools::shown;
 /// The data folder, made or checked so only you can reach it.
 pub fn data_dir() -> Result<PathBuf> {
     make_private_dir(&data_dir_from(std::env::var("TUITOK_DATA_DIR").ok())?)
+}
+
+/// Where the data folder is, without making it: for `--check`.
+pub fn data_dir_path() -> Result<PathBuf> {
+    data_dir_from(std::env::var("TUITOK_DATA_DIR").ok())
 }
 
 fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
@@ -78,7 +83,7 @@ fn clear_acls(dir: &Path) {
 }
 
 /// The user tuitok runs as.
-fn euid() -> u32 {
+pub fn euid() -> u32 {
     // SAFETY: geteuid can't fail and touches no memory.
     unsafe { libc::geteuid() }
 }
@@ -118,6 +123,8 @@ fn private_place(dir: &Path) -> Result<()> {
 /// the videos downloaded ahead. Deleted when the run ends ([`Session::end`]),
 /// and by the next run if it crashed (its process gone).
 pub struct Session {
+    /// The data folder it's in, where `guest.json` is kept between runs.
+    pub data: PathBuf,
     pub dir: PathBuf,
     pub profile: PathBuf,
     pub cache: PathBuf,
@@ -132,6 +139,7 @@ impl Session {
             profile: dir.join("chrome"),
             cache: dir.join("cache"),
             dir,
+            data,
         };
         let _ = std::fs::remove_dir_all(&session.dir);
         private_dir(&session.dir)?;

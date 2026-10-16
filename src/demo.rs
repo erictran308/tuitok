@@ -114,7 +114,7 @@ pub fn comments(n: usize) -> Vec<Comment> {
         .iter()
         .cycle()
         .skip(n)
-        .take(3)
+        .take(COMMENTS.len())
         .map(|&(name, text, likes)| Comment {
             name: name.into(),
             text: text.into(),
@@ -126,7 +126,11 @@ pub fn comments(n: usize) -> Vec<Comment> {
 /// Video `n`'s cover: a gradient between two colours, with soft circles of
 /// light on it.
 pub fn cover(n: usize) -> DynamicImage {
-    let (width, height) = (360u32, 640u32);
+    cover_sized(n, 360, 640)
+}
+
+/// Video `n`'s cover, `width`×`height` pixels.
+fn cover_sized(n: usize, width: u32, height: u32) -> DynamicImage {
     let (top, bottom) = COLOURS[n % COLOURS.len()];
     let shift = n as f32 * 0.17;
     let circles = [
@@ -160,5 +164,66 @@ mod tests {
         assert_eq!(videos.len(), VIDEOS.len());
         assert!(videos.iter().all(|v| v.best((608, 1080)).is_some()));
         assert_eq!(cover(2).height(), 640);
+    }
+
+    /// One frame of `--demo` in Pepper for the README's picture: every
+    /// cell, and where the cover goes, in `target/hero/` for
+    /// `tools/hero.py` (`cargo test -- --ignored export_hero_screen`). The
+    /// cell size is the one hero.py draws with, so the box keeps its shape.
+    #[test]
+    #[ignore = "writes target/hero/ for tools/hero.py"]
+    fn export_hero_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Modifier};
+
+        let (cols, rows) = (112u16, 40u16);
+        let cell = (16u16, 34u16);
+        let mut app = crate::app::App::demo(true);
+        app.cell = cell;
+        app.size = (cols, rows);
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let video = crate::ui::areas(Rect::new(0, 0, cols, rows), cell, false).video;
+        let cover = crate::ui::cover_area(video, true);
+        let hex = |color: Color| match color {
+            Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+            _ => None,
+        };
+        let mut cells = Vec::new();
+        for y in 0..rows {
+            for x in 0..cols {
+                let c = &buffer[(x, y)];
+                // Where the cover goes, hero.py draws it.
+                let symbol = if cover.contains((x, y).into()) {
+                    " "
+                } else {
+                    c.symbol()
+                };
+                cells.push(serde_json::json!([
+                    symbol,
+                    hex(c.fg),
+                    hex(c.bg),
+                    c.modifier.contains(Modifier::BOLD),
+                ]));
+            }
+        }
+        let screen = serde_json::json!({
+            "cols": cols,
+            "rows": rows,
+            "cell": [cell.0, cell.1],
+            "bg": hex(app.colors.bg),
+            "fg": hex(app.colors.text),
+            "cells": cells,
+            "cover": [cover.x, cover.y, cover.width, cover.height],
+        });
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/hero");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("screen.json"), screen.to_string()).unwrap();
+        cover_sized(0, 1080, 1920)
+            .save(dir.join("cover.png"))
+            .unwrap();
     }
 }

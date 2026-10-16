@@ -454,7 +454,7 @@ fn fits_header(s: &str, max: usize) -> bool {
 /// The cookies to carry to the next batch (`Network.getCookies`' answer),
 /// as `Network.setCookies` takes them: only TikTok's, names and values fit
 /// for a header, at most `MAX_COOKIES`.
-fn guest_cookies(cookies: &Value) -> Vec<Value> {
+pub fn guest_cookies(cookies: &Value) -> Vec<Value> {
     let tiktok = |domain: &str| {
         let host = domain.strip_prefix('.').unwrap_or(domain);
         host == "tiktok.com" || host.ends_with(".tiktok.com")

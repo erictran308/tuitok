@@ -1,7 +1,7 @@
 //! A video's top comments, in TikTok's own order. Its web page asks
 //! `www.tiktok.com/api/comment/list/` for them, and unlike the feed that
-//! answers a plain request: no signature, no cookie (tried on 12 videos, 0.4
-//! to 0.7 s and about 15 KB each). The address is made from a checked id
+//! answers a plain request: no signature, no cookie (tried on 20 videos, 0.4
+//! to 0.7 s; 10 comments are 23 to 40 KB). The address is made from a checked id
 //! only; the answer is read leniently, its text cleaned and capped, and kept
 //! in memory for the videos near the one shown, never on disk.
 
@@ -14,9 +14,10 @@ use crate::cache;
 use crate::text;
 use crate::video::{self, MAX_NAME, VideoId};
 
-/// Comments asked for: TikTok sent 3 to 5 of 5, holding some back.
-pub const COUNT: usize = 5;
-/// The biggest answer read: 5 comments came to about 15 KB.
+/// Comments asked for: TikTok sent 7 to 10 of 10, holding some back, in the
+/// same time as 5. The panel shows as many as fit.
+pub const COUNT: usize = 10;
+/// The biggest answer read: 10 comments came to 23 to 40 KB.
 const MAX_BYTES: usize = 512 * 1024;
 /// The longest comment kept: TikTok's own limit is 150 characters.
 const MAX_TEXT: usize = 300;
@@ -113,7 +114,7 @@ mod tests {
         let id = VideoId::new("7658861391901740308").unwrap();
         assert_eq!(
             url(&id),
-            "https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id=7658861391901740308&count=5&cursor=0"
+            "https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id=7658861391901740308&count=10&cursor=0"
         );
         assert!(url_allowed(&url(&id)));
         assert!(!url_allowed("http://www.tiktok.com/api/comment/list/"));
@@ -132,7 +133,7 @@ mod tests {
             {"text": "6"}, {"text": "7"}, {"text": "8"},
         ]});
         let comments = parse(&answer);
-        assert_eq!(comments.len(), COUNT);
+        assert_eq!(comments.len(), 6);
         assert_eq!(
             comments[0],
             Comment {
@@ -149,6 +150,8 @@ mod tests {
         assert_eq!(comments[2].text.chars().count(), MAX_TEXT);
         assert!(parse(&json!({"status_code": 0})).is_empty());
         assert!(parse(&json!("nonsense")).is_empty());
+        let many: Vec<Value> = (0..30).map(|n| json!({"text": n.to_string()})).collect();
+        assert_eq!(parse(&json!({ "comments": many })).len(), COUNT);
     }
 
     /// Against TikTok: a batch's first videos' comments
