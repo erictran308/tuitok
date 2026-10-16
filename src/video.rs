@@ -105,8 +105,8 @@ impl Video {
             let url = video.get("playAddr").and_then(Value::as_str)?;
             renditions.push(Rendition {
                 codec: Codec::H264,
-                width: number(video.get("width")).unwrap_or(0) as u32,
-                height: number(video.get("height")).unwrap_or(0) as u32,
+                width: number(video.get("width")).unwrap_or(0).min(16_384) as u32,
+                height: number(video.get("height")).unwrap_or(0).min(16_384) as u32,
                 bytes: None,
                 urls: vec![url.to_owned()],
             });

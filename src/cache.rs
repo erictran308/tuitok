@@ -202,9 +202,21 @@ async fn write(
     Ok(())
 }
 
-/// Whether a file starts as an MP4 does: with a box of type `ftyp`.
+/// Whether a file starts as an MP4 does: a box of type `ftyp`, of a size
+/// such a box has (its brands: 16 bytes to a few hundred), with a brand of
+/// letters, digits or spaces. The type alone would let through a file that
+/// starts `REM ftyp`, which mpv would read as a CUE sheet.
 fn is_mp4(head: &[u8]) -> bool {
-    head.len() >= 8 && &head[4..8] == b"ftyp"
+    let [a, b, c, d, rest @ ..] = head else {
+        return false;
+    };
+    let size = u32::from_be_bytes([*a, *b, *c, *d]);
+    rest.len() >= 8
+        && &rest[..4] == b"ftyp"
+        && (16..=1024).contains(&size)
+        && rest[4..8]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b' ')
 }
 
 #[cfg(test)]
@@ -229,6 +241,10 @@ mod tests {
         assert!(is_mp4(b"\0\0\0\x20ftypisom\0\0\x02\0"));
         assert!(!is_mp4(b"<html><head>"));
         assert!(!is_mp4(b"\0\0"));
+        assert!(!is_mp4(b"REM ftypisom"));
+        assert!(!is_mp4(b"\0\0\0\x20ftyp\x1b[2J"));
+        assert!(!is_mp4(b"\0\0\0\x20ftyp"));
+        assert!(is_mp4(b"\0\0\0\x18ftypmp42"));
     }
 
     /// Against TikTok: `cargo test -- --ignored live`.

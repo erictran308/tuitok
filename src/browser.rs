@@ -8,10 +8,11 @@ use std::ffi::OsString;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -118,37 +119,73 @@ impl Drop for Browser {
     }
 }
 
-/// Lightpanda's DevTools on a free 127.0.0.1 port, which any local program
-/// could reach while it runs: it runs only for a batch, telemetry off.
+/// Lightpanda's DevTools on a 127.0.0.1 port, which local programs can
+/// reach, so:
+/// - Lightpanda picks the port itself and names it in its log
+///   ([`listening_port`]): no other program can take it between its being
+///   chosen and Lightpanda's listening, and be handed tuitok's connection
+///   and the guest's cookies.
+/// - It takes one client (`--cdp-max-connections 1`): once tuitok is
+///   connected, nothing else can drive it, read its cookies or what it
+///   fetched, a script in TikTok's page included. A program that got in
+///   first leaves tuitok refused before any cookie is sent, and Chrome
+///   fetches instead.
+/// - Its pages can't reach private or local addresses
+///   (`--block-private-networks`): TikTok's scripts can't probe your network
+///   or this computer's services from it.
+///
+/// It runs only for a batch, telemetry off.
 async fn lightpanda(program: &Path) -> Result<Browser> {
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
-        .local_addr()?
-        .port();
     let mut command = Command::new(program);
     command
-        .args(["serve", "--host", "127.0.0.1", "--port"])
-        .arg(port.to_string())
-        .arg("--disable-metrics")
+        .args(["serve", "--host", "127.0.0.1", "--port", "0"])
+        .args([
+            "--cdp-max-connections",
+            "1",
+            "--block-private-networks",
+            "--disable-metrics",
+        ])
         .env_clear()
         .envs(tools::child_env())
         .env("LIGHTPANDA_DISABLE_TELEMETRY", "true");
     let mut child = {
         let _starting = tools::starting();
-        spawn(&mut command, "Lightpanda")?
+        spawn(&mut command, "Lightpanda", Stdio::piped())?
     };
     let group = child.id().map(|pid| pid as i32);
-    let url = format!("ws://127.0.0.1:{port}/");
-    let deadline = Instant::now() + START_WAIT;
-    let (cdp, events) = loop {
-        match Cdp::websocket(&url).await {
-            Ok(connected) => break connected,
-            Err(_) if Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut log = BufReader::new(child.stderr.take().context("no log from Lightpanda")?);
+    let port = tokio::time::timeout(START_WAIT, async {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match (&mut log)
+                .take(MAX_LOG_LINE)
+                .read_until(b'\n', &mut line)
+                .await
+            {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {
+                    if let Some(port) = listening_port(&String::from_utf8_lossy(&line)) {
+                        return Some(port);
+                    }
+                }
             }
-            Err(e) => {
-                let _ = child.kill().await;
-                return Err(e.context("Lightpanda didn't start listening"));
-            }
+        }
+    })
+    .await;
+    let Ok(Some(port)) = port else {
+        let _ = child.kill().await;
+        anyhow::bail!("Lightpanda didn't start listening");
+    };
+    // Its log goes on: read to the end, so it never waits on a full pipe.
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut log, &mut tokio::io::sink()).await;
+    });
+    let (cdp, events) = match Cdp::websocket(&format!("ws://127.0.0.1:{port}/")).await {
+        Ok(connected) => connected,
+        Err(e) => {
+            let _ = child.kill().await;
+            return Err(e.context("Lightpanda took no connection from tuitok"));
         }
     };
     Ok(Browser {
@@ -181,7 +218,7 @@ async fn chrome(program: &Path, profile: &Path) -> Result<Browser> {
         let (a, b) = (chrome_reads.as_raw_fd(), chrome_writes.as_raw_fd());
         // SAFETY: as_fd3_and_4 makes only async-signal-safe calls.
         unsafe { command.pre_exec(move || as_fd3_and_4(a, b)) };
-        let child = spawn(&mut command, "Chrome")?;
+        let child = spawn(&mut command, "Chrome", Stdio::null())?;
         (child, to_chrome, from_chrome)
     };
     let group = child.id().map(|pid| pid as i32);
@@ -205,11 +242,26 @@ async fn chrome(program: &Path, profile: &Path) -> Result<Browser> {
 
 /// Starts `command` in a process group of its own, nothing on its standard
 /// streams. The caller holds `tools::starting`.
-fn spawn(command: &mut Command, name: &str) -> Result<Child> {
+/// The longest line of Lightpanda's log read when looking for its port.
+const MAX_LOG_LINE: u64 = 4096;
+
+/// The port in Lightpanda's `msg="server running" address=127.0.0.1:PORT`.
+fn listening_port(line: &str) -> Option<u16> {
+    if !line.contains("msg=\"server running\"") {
+        return None;
+    }
+    let after = line.split_once(" address=127.0.0.1:")?.1;
+    let digits = &after[..after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len())];
+    digits.parse().ok().filter(|&port: &u16| port != 0)
+}
+
+fn spawn(command: &mut Command, name: &str, stderr: Stdio) -> Result<Child> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
@@ -249,5 +301,28 @@ mod tests {
         assert_eq!(Engine::parse("chrome"), Some(Engine::Chrome));
         assert_eq!(Engine::parse("firefox"), None);
         assert_eq!(Engine::Chrome.name(), "Chrome");
+    }
+
+    #[test]
+    fn lightpandas_port_from_its_log() {
+        let running = "$time=1792142614939 $scope=note $level=note $msg=\"server running\" \
+                       address=127.0.0.1:49645 max_connections=16208 max_browser_connections=1\n";
+        assert_eq!(listening_port(running), Some(49645));
+        assert_eq!(
+            listening_port("$msg=\"server running\" address=127.0.0.1:0"),
+            None
+        );
+        assert_eq!(
+            listening_port("$msg=\"server running\" address=0.0.0.0:9222"),
+            None
+        );
+        assert_eq!(
+            listening_port("$msg=\"page\" url=x address=127.0.0.1:1234"),
+            None
+        );
+        assert_eq!(
+            listening_port("$msg=\"server running\" address=127.0.0.1:99999"),
+            None
+        );
     }
 }
