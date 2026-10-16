@@ -1,0 +1,16 @@
+/target
+
+# Your settings and data (when TUITOK_DATA_DIR points here).
+.env
+.tuitok/
+
+# The spikes' Python caches.
+__pycache__/
+
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json
+
+# macOS folder settings.
+.DS_Store
