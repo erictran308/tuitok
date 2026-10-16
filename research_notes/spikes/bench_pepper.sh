@@ -9,7 +9,8 @@ set -eu
 clip=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 out=$2
 app=/Applications/Pepper.app
-measure=/Users/eric/projects/Personal/pepper/pepper-play/bench/measure.py
+# Pepper's checkout, next to tuitok's.
+measure=$(cd "$(dirname "$0")/../../../pepper" && pwd)/pepper-play/bench/measure.py
 q() {
     printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"
 }
