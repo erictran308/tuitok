@@ -4,6 +4,7 @@
 
 use image::{DynamicImage, Rgb, RgbImage};
 
+use crate::comments::Comment;
 use crate::video::{Codec, Rendition, Video, VideoId};
 
 /// Made up: handle, name, caption, sound, length in seconds, plays.
@@ -96,6 +97,29 @@ pub fn videos() -> Vec<Video> {
                 token: None,
             },
         )
+        .collect()
+}
+
+/// Made up: who, what, likes.
+const COMMENTS: [(&str, &str, u64); 4] = [
+    ("night owl", "the zoomies are a whole lifestyle", 18_400),
+    ("Tam 🌙", "me at 3am looking for snacks", 9_100),
+    ("made.up.dog", "amateur. watch this →", 2_300),
+    ("someone", "the sound effects 😭", 640),
+];
+
+/// Video `n`'s made-up top comments.
+pub fn comments(n: usize) -> Vec<Comment> {
+    COMMENTS
+        .iter()
+        .cycle()
+        .skip(n)
+        .take(3)
+        .map(|&(name, text, likes)| Comment {
+            name: name.into(),
+            text: text.into(),
+            likes: Some(likes / (n as u64 + 1)),
+        })
         .collect()
 }
 

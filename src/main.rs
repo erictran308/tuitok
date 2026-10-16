@@ -6,6 +6,7 @@ mod app;
 mod browser;
 mod cache;
 mod cdp;
+mod comments;
 mod config;
 mod covers;
 mod demo;

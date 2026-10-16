@@ -1,8 +1,8 @@
 //! Drawing: the video's box, upright (9:16) and as tall as the window (the
 //! whole tab with `f`), and beside it a panel with the video's author,
-//! caption, sound, counts and where it's at, then the keys and the feed's
-//! state on the bottom line. Until a video plays in Pepper's box, the box
-//! shows its cover, with under it what plays and how it's going.
+//! caption, sound, counts, where it's at and top comments, then the keys and
+//! the feed's state on the bottom line. Until a video plays in Pepper's box,
+//! the box shows its cover, with under it what plays and how it's going.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -12,14 +12,20 @@ use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 
 use crate::app::{App, FeedState};
 use crate::cache::Download;
+use crate::comments::Comments;
 use crate::covers::Cover;
 use crate::pepper;
 use crate::video::{Video, VideoId};
 
 /// The panel beside the video, in columns, shown in windows at least
 /// `PANEL_FROM` columns wide.
-const PANEL: u16 = 36;
-const PANEL_FROM: u16 = 80;
+const PANEL: u16 = 48;
+const PANEL_FROM: u16 = 90;
+
+/// The logo's badge: TikTok's note, white on black as on its icon (true
+/// black: `Color::Black` is the palette's colour 0, grey in Catppuccin).
+const BADGE_BG: Color = Color::Rgb(0, 0, 0);
+const BADGE_FG: Color = Color::Rgb(255, 255, 255);
 
 /// Why videos play in mpv's window in Pepper: multiplexer `name` is between.
 fn behind(name: &str) -> String {
@@ -185,10 +191,16 @@ fn download_line(app: &App, id: &VideoId) -> Line<'static> {
 
 fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
+    // tuitube's logo, with TikTok's note for its play button.
+    let logo = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(" ♪ ", Style::new().fg(BADGE_FG).bg(BADGE_BG).bold()),
+        Span::styled(" tuitok ", Style::new().fg(c.text).bold()),
+    ]);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(c.border))
-        .title(Line::from(" ♪ tuitok ").fg(c.accent).bold())
+        .title(logo)
         .padding(Padding::new(2, 2, 1, 1));
     let width = block.inner(area).width;
     let mut lines: Vec<Line> = Vec::new();
@@ -237,6 +249,27 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(name) = app.behind_multiplexer {
                 lines.push(Line::default());
                 lines.push(Line::from(behind(name)).fg(c.subtext));
+            }
+            // Last: what doesn't fit is cut off at the bottom.
+            if let Some(Comments::Ready(comments)) = app.comments.get(&v.id)
+                && !comments.is_empty()
+            {
+                lines.push(Line::default());
+                lines.push(Line::from("Top comments").fg(c.subtext).bold());
+                for comment in comments {
+                    lines.push(Line::default());
+                    let mut who = vec![Span::from(comment.name.clone()).fg(c.accent)];
+                    if let Some(likes) = comment.likes {
+                        who.push(Span::from(format!(" · ♥ {}", count(likes))).fg(c.dim));
+                    }
+                    lines.push(Line::from(who));
+                    lines.extend(
+                        comment
+                            .text
+                            .lines()
+                            .map(|line| Line::from(line.to_owned()).fg(c.text)),
+                    );
+                }
             }
         }
         None if app.pepper => lines.push(Line::from("In Pepper: videos play in the box").fg(c.ok)),
@@ -434,7 +467,7 @@ pub mod tests {
         app.feed = FeedState::NoBrowser;
         let text = screen(&app, 120, 40);
         assert!(text.contains("No videos yet"));
-        assert!(text.contains("╭ ♪ tuitok ─"));
+        assert!(text.contains("╭  ♪  tuitok ─"));
         assert!(text.contains("Not in Pepper"));
         let last = text.lines().last().unwrap();
         assert!(last.starts_with(" j k next/back  space pause  m mute  f fill  r more  q quit"));
@@ -580,7 +613,27 @@ pub mod tests {
         app.pepper = true;
         let text = screen(&app, 60, 30);
         assert!(text.contains("No videos yet"));
-        assert!(!text.contains("♪ tuitok"));
+        assert!(!text.contains("tuitok ─"));
+    }
+
+    #[test]
+    fn top_comments_come_last_in_the_panel() {
+        use crate::comments::Comment;
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        let id = VideoId::new("1").unwrap();
+        app.comments.insert(id.clone(), Comments::Loading);
+        assert!(!screen(&app, 120, 40).contains("Top comments"));
+        let comment = Comment {
+            name: "Linh".into(),
+            text: "trời cây chôm chôm nhìu quả thế".into(),
+            likes: Some(866),
+        };
+        app.comments.insert(id, Comments::Ready(vec![comment]));
+        let text = screen(&app, 120, 40);
+        let at = |shown: &str| text.find(shown).unwrap_or_else(|| panic!("{shown}"));
+        assert!(at("1:15 · 1 of 1") < at("Top comments"));
+        assert!(at("Top comments") < at("Linh · ♥ 866"));
+        assert!(at("Linh · ♥ 866") < at("trời cây chôm chôm"));
     }
 
     #[test]

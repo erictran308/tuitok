@@ -197,7 +197,7 @@ fn rendition(entry: &Value) -> Option<Rendition> {
 }
 
 /// A count, as a number or a string of digits.
-fn number(value: Option<&Value>) -> Option<u64> {
+pub fn number(value: Option<&Value>) -> Option<u64> {
     match value? {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse().ok(),
@@ -208,7 +208,7 @@ fn number(value: Option<&Value>) -> Option<u64> {
 /// The host of an `https://` address with a plain one: lowercase letters,
 /// digits, dots and hyphens; no user, password, port or escapes. The whole
 /// address must be printable ASCII without spaces, and not too long.
-fn https_host(url: &str) -> Option<&str> {
+pub fn https_host(url: &str) -> Option<&str> {
     if url.len() > MAX_URL || !url.bytes().all(|b| b.is_ascii_graphic()) {
         return None;
     }

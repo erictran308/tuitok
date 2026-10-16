@@ -14,7 +14,7 @@ No account, no login, nothing kept after you quit.
 
 ## What it does
 
-- **For You, one at a time.** The video in an upright box, its cover while it loads, and beside it the author, caption, sound, plays, likes, comments and shares, where it's at and a bar of how far. Each video loops, as on TikTok.
+- **For You, one at a time.** The video in an upright box, its cover while it loads, and beside it the author, caption, sound, plays, likes, comments and shares, where it's at and a bar of how far, and its top comments. Each video loops, as on TikTok.
 - **Starts at once.** The first video plays about 2.5 s after tuitok starts: the first batch is a single video, then they grow 2, 3, 5, 8 and 13, one after another, each handed on as the page gets it. The next few are downloaded while you watch, so `j` plays the next one straight away. Long ones stream instead.
 - **In Pepper, inside the terminal.** In a [Pepper](https://github.com/erictran308/pepper) tab the video plays in the box itself, through Pepper's player; `f` fills the tab with it. In other terminals it plays in mpv's window, with the cover in the box.
 - **Light.** A small headless browser ([Lightpanda](https://github.com/lightpanda-io/browser), else Chrome) opens TikTok's For You to fetch a batch, then closes. After the first 32 videos, the next 13 are fetched only when you reach the 8th of the last 13 (about 10 s of the browser each time), so it never runs for the whole time you watch.
@@ -57,7 +57,7 @@ Inside a multiplexer (tmux, screen, zellij, herdr) Pepper can't be told where it
 - **No account.** tuitok never logs in. The feed is TikTok's logged-out For You: popular videos for your country, not yours.
 - **Nothing kept.** Videos are downloaded into a folder of that run's only, readable only by you, and it's deleted when tuitok quits (or by the next run, if it crashed); covers stay in memory. No history, no settings file yet.
 - **The browser runs only while it fetches**, with a profile of that run's, pictures, video and sound refused, and Lightpanda's telemetry off.
-- **Only TikTok's own hosts** are fetched from, over https; redirects elsewhere are refused. Text from TikTok is cleaned before it's shown, pictures are decoded only as JPEG within size limits, and downloaded videos must be MP4s.
+- **Only TikTok's own hosts** are fetched from, over https; redirects elsewhere are refused. Top comments come from TikTok's comment list, asked without any cookie. Text from TikTok is cleaned before it's shown, pictures are decoded only as JPEG within size limits, and downloaded videos must be MP4s.
 - **Nothing private on a command line.** The guest's cookies stay in tuitok's memory: they go to the next batch's browser, so TikTok goes on with the same guest's feed instead of starting over, and the one the videos need goes to the player only over its private socket.
 
 ## Disclaimer

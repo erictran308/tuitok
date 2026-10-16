@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::browser::Engine;
 use crate::cache::{self, Download};
+use crate::comments::{self, Comment, Comments};
 use crate::config::Session;
 use crate::covers::{self, Cover, Encoded};
 use crate::demo;
@@ -47,6 +48,9 @@ const REFILL_AT: usize = feed::BATCH - 8;
 /// tries at once).
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// Comments are fetched for the video shown and this many after it.
+const COMMENTS_AHEAD: usize = 1;
+
 /// How far `h` and `l` seek, in seconds.
 const SEEK: f64 = 5.0;
 
@@ -70,6 +74,11 @@ pub enum AppEvent {
     CoverFetched {
         id: VideoId,
         picture: Result<DynamicImage, String>,
+    },
+    /// A video's top comments came, or didn't.
+    CommentsFetched {
+        id: VideoId,
+        comments: Result<Vec<Comment>, String>,
     },
     /// A cover was encoded for the terminal, or wasn't.
     CoverEncoded {
@@ -162,6 +171,10 @@ pub struct App {
     pub covers: HashMap<VideoId, Cover>,
     picker: Option<Picker>,
     cover_client: Option<reqwest::Client>,
+    /// Top comments by video, and the client for `www.tiktok.com`'s
+    /// comment list.
+    pub comments: HashMap<VideoId, Comments>,
+    comment_client: Option<reqwest::Client>,
     /// `f` in Pepper: the video fills the tab.
     pub fullscreen: bool,
     /// `--demo`: made-up videos, nothing fetched, downloaded or played.
@@ -225,6 +238,8 @@ impl App {
             covers: HashMap::new(),
             picker: None,
             cover_client: None,
+            comments: HashMap::new(),
+            comment_client: None,
             fullscreen: false,
             demo: false,
             behind_multiplexer: None,
@@ -240,8 +255,10 @@ impl App {
         if !self.demo {
             self.client = Some(cache::client(crate::video::video_url_allowed));
             self.cover_client = Some(cache::client(crate::video::image_url_allowed));
+            self.comment_client = Some(cache::client(comments::url_allowed));
         }
         self.want_covers();
+        self.want_comments();
         self.fetch_more();
         let mut terminal_events = EventStream::new();
         // The terminal window closed (SIGHUP), or tuitok was asked to end
@@ -331,6 +348,8 @@ impl App {
                 encoding: false,
             };
             app.covers.insert(video.id.clone(), cover);
+            let made_up = Comments::Ready(demo::comments(n));
+            app.comments.insert(video.id.clone(), made_up);
         }
         app.on_batch(Ok(Batch {
             videos,
@@ -406,6 +425,7 @@ impl App {
                 self.add(spare);
                 self.prefetch();
                 self.want_covers();
+                self.want_comments();
                 self.play_current();
             }
             if self.found_so_far() < self.batch_size {
@@ -435,13 +455,19 @@ impl App {
                 self.add(videos);
                 self.prefetch();
                 self.want_covers();
+                self.want_comments();
                 self.play_current();
             }
             AppEvent::Batch(batch) => {
                 self.on_batch(batch);
                 self.prefetch();
                 self.want_covers();
+                self.want_comments();
                 self.play_current();
+            }
+            AppEvent::CommentsFetched { id, comments } => {
+                let comments = comments.map_or(Comments::Failed, Comments::Ready);
+                self.comments.insert(id, comments);
             }
             AppEvent::Progress { id, got, of } => {
                 if let Some(Download::Getting {
@@ -778,6 +804,33 @@ impl App {
             {
                 self.covers.remove(&video.id);
             }
+            if (n < keep_from || n > keep_to)
+                && !matches!(self.comments.get(&video.id), Some(Comments::Loading))
+            {
+                self.comments.remove(&video.id);
+            }
+        }
+    }
+
+    /// Fetches the top comments of the video shown and the
+    /// `COMMENTS_AHEAD` after it that aren't asked for yet.
+    fn want_comments(&mut self) {
+        let (Some(client), Some(tx)) = (self.comment_client.clone(), self.tx.clone()) else {
+            return;
+        };
+        let end = (self.at + COMMENTS_AHEAD + 1).min(self.videos.len());
+        for video in self.videos.get(self.at..end).unwrap_or_default() {
+            if self.comments.contains_key(&video.id) {
+                continue;
+            }
+            self.comments.insert(video.id.clone(), Comments::Loading);
+            let (client, tx, id) = (client.clone(), tx.clone(), video.id.clone());
+            tokio::spawn(async move {
+                let comments = comments::fetch(&client, &id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(AppEvent::CommentsFetched { id, comments });
+            });
         }
     }
 
@@ -894,6 +947,7 @@ impl App {
         self.prune();
         self.prefetch();
         self.want_covers();
+        self.want_comments();
         self.play_current();
         self.refill();
     }
