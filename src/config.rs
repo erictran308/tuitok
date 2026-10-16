@@ -113,6 +113,61 @@ fn private_place(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The folders one run of tuitok uses, in `session-<pid>` in the data
+/// folder, so two at once don't touch each other's: Chrome's profile and
+/// the videos downloaded ahead. Deleted when the run ends ([`Session::end`]),
+/// and by the next run if it crashed (its process gone).
+pub struct Session {
+    pub dir: PathBuf,
+    pub profile: PathBuf,
+    pub cache: PathBuf,
+}
+
+impl Session {
+    pub fn start() -> Result<Self> {
+        let data = data_dir()?;
+        remove_left_behind(&data);
+        let dir = data.join(format!("session-{}", std::process::id()));
+        let session = Self {
+            profile: dir.join("chrome"),
+            cache: dir.join("cache"),
+            dir,
+        };
+        let _ = std::fs::remove_dir_all(&session.dir);
+        private_dir(&session.dir)?;
+        private_dir(&session.cache)?;
+        Ok(session)
+    }
+
+    pub fn end(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Deletes the session folders of runs whose process is gone.
+fn remove_left_behind(data: &Path) {
+    let Ok(entries) = std::fs::read_dir(data) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("session-"))
+            .and_then(|n| n.parse::<i32>().ok())
+            .filter(|&pid| pid > 0)
+        else {
+            continue;
+        };
+        // SAFETY: signal 0 only asks whether the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Creates `dir` (and its parents) readable only by you.
 pub fn private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

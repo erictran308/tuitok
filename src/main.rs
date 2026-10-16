@@ -4,6 +4,7 @@
 
 mod app;
 mod browser;
+mod cache;
 mod cdp;
 mod config;
 mod feed;
@@ -84,22 +85,14 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// Chrome's profile, in the data folder: kept between a session's batches,
-/// deleted when it ends (and before it starts, if a crash left it).
-fn chrome_profile() -> anyhow::Result<PathBuf> {
-    let profile = config::data_dir()?.join("chrome");
-    let _ = std::fs::remove_dir_all(&profile);
-    Ok(profile)
-}
-
 fn fail(e: &anyhow::Error) -> ExitCode {
     eprintln!("tuitok: {}", text::one_line(&format!("{e:#}"), 400));
     ExitCode::FAILURE
 }
 
 fn run() -> ExitCode {
-    let profile = match chrome_profile() {
-        Ok(profile) => profile,
+    let session = match config::Session::start() {
+        Ok(session) => session,
         Err(e) => return fail(&e),
     };
     let runtime = match runtime() {
@@ -107,14 +100,14 @@ fn run() -> ExitCode {
         Err(e) => return fail(&e.into()),
     };
     let engines = feed::engines(&tools::Tools::find(), None);
-    let mut app = app::App::new(pepper::port().is_some(), engines, profile.clone());
+    let mut app = app::App::new(pepper::port().is_some(), engines, &session);
     let mut terminal = ratatui::init();
     let result = runtime.block_on(app.run(&mut terminal));
     ratatui::restore();
-    // A batch still being fetched ends here, its browser killed (`Browser`'s
-    // `Drop`), before its profile goes.
+    // A batch still being fetched and the downloads end here, the browser
+    // killed (`Browser`'s `Drop`), before the session's folder goes.
     drop(runtime);
-    let _ = std::fs::remove_dir_all(&profile);
+    session.end();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e.into()),
@@ -140,8 +133,8 @@ fn check() {
 
 /// `--feed`: one batch, listed. Never the cookie itself.
 fn list_feed(only: Option<Engine>) -> ExitCode {
-    let profile = match chrome_profile() {
-        Ok(profile) => profile,
+    let session = match config::Session::start() {
+        Ok(session) => session,
         Err(e) => return fail(&e),
     };
     let runtime = match runtime() {
@@ -149,9 +142,13 @@ fn list_feed(only: Option<Engine>) -> ExitCode {
         Err(e) => return fail(&e.into()),
     };
     let engines = feed::engines(&tools::Tools::find(), only);
-    let result = runtime.block_on(feed::fetch_any(engines, profile.clone(), feed::WANT));
+    let result = runtime.block_on(feed::fetch_any(
+        engines,
+        session.profile.clone(),
+        feed::WANT,
+    ));
     drop(runtime);
-    let _ = std::fs::remove_dir_all(&profile);
+    session.end();
     let batch = match result {
         Ok(batch) => batch,
         Err(e) => return fail(&e),

@@ -3,6 +3,8 @@
 //! rendition is dropped. Text is cleaned and capped where it's read, and
 //! only addresses on TikTok's own hosts are kept.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use crate::text;
@@ -77,6 +79,9 @@ pub struct Video {
     /// The cover picture, on TikTok's image hosts ([`image_url_allowed`]).
     pub cover: Option<String>,
     pub renditions: Vec<Rendition>,
+    /// The guest cookie its addresses need: its batch's (`feed::read`), as
+    /// each batch's browser is a new guest.
+    pub token: Option<Arc<str>>,
 }
 
 impl Video {
@@ -138,6 +143,7 @@ impl Video {
                 .find(|url| image_url_allowed(url))
                 .map(str::to_owned),
             renditions,
+            token: None,
         })
     }
 

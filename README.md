@@ -10,7 +10,7 @@ No account, no login.
 </div>
 
 > [!WARNING]
-> **Early.** The feed works: `tuitok` shows TikTok's For You one video at a time (author, caption, sound, counts), and `tuitok --feed` lists a batch. Playing comes next: [the plan](reports/TikTok%20terminal%20client.md#the-plan).
+> **Early.** The feed works: `tuitok` shows TikTok's For You one video at a time (author, caption, sound, counts), downloading the next few ahead, and `tuitok --feed` lists a batch. Playing comes next: [the plan](reports/TikTok%20terminal%20client.md#the-plan).
 
 > [!IMPORTANT]
 > **For personal use only.** tuitok isn't made, endorsed or allowed by TikTok or ByteDance. It reads TikTok's web feed through a headless browser, which TikTok's terms don't permit. It never logs in. See the [disclaimer](#disclaimer).

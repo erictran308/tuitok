@@ -1,7 +1,8 @@
 //! Drawing: the video's box, upright (9:16) and as tall as the window, and
 //! beside it a panel with the video's author, caption, sound and counts,
 //! then the keys and the feed's state on the bottom line. Until playing
-//! lands, the box says what would play: the length and the rendition.
+//! lands, the box says what would play (the length and the rendition) and
+//! how its download is going.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -10,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::app::{App, FeedState};
+use crate::cache::Download;
 use crate::pepper;
 
 /// The panel beside the video, in columns, shown in windows at least
@@ -17,10 +19,15 @@ use crate::pepper;
 const PANEL: u16 = 36;
 const PANEL_FROM: u16 = 80;
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let c = &app.colors;
-    let area = frame.area();
-    frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
+/// Where things go in a window: the video's box, the panel beside it (in
+/// wide windows), the bottom line. `App::box_pixels` lays it out the same.
+pub struct Areas {
+    pub video: Rect,
+    pub panel: Option<Rect>,
+    pub bottom: Rect,
+}
+
+pub fn areas(area: Rect, cell: (u16, u16)) -> Areas {
     let [main, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     let (video_side, panel) = if main.width >= PANEL_FROM {
         let [video, panel] =
@@ -29,16 +36,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         (main, None)
     };
-    let video = pepper::portrait_area(video_side, app.cell);
-    frame.render_widget(Block::new().style(Style::new().bg(c.panel)), video);
-    draw_in_box(frame, app, video);
-    if let Some(panel) = panel {
-        draw_panel(frame, app, panel);
+    Areas {
+        video: pepper::portrait_area(video_side, cell),
+        panel,
+        bottom,
     }
-    draw_bottom(frame, app, bottom);
 }
 
-/// In the box, centred: what would play, or why there's nothing.
+pub fn draw(frame: &mut Frame, app: &App) {
+    let c = &app.colors;
+    let area = frame.area();
+    frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
+    let areas = areas(area, app.cell);
+    frame.render_widget(Block::new().style(Style::new().bg(c.panel)), areas.video);
+    draw_in_box(frame, app, areas.video);
+    if let Some(panel) = areas.panel {
+        draw_panel(frame, app, panel);
+    }
+    draw_bottom(frame, app, areas.bottom);
+}
+
+/// In the box, centred: what would play and how its download is going, or
+/// why there's nothing.
 fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     let lines = match app.current() {
@@ -49,13 +68,24 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
             );
             let mut lines = vec![Line::from(clock(video.seconds)).fg(c.text)];
             if let Some(r) = video.best(pixels) {
-                lines.push(
-                    Line::from(format!("{} {}×{}", r.codec.name(), r.width, r.height)).fg(c.dim),
-                );
+                let mut what = format!("{} {}×{}", r.codec.name(), r.width, r.height);
                 if let Some(bytes) = r.bytes {
-                    lines.push(Line::from(size(bytes)).fg(c.dim));
+                    what.push_str(&format!(" · {}", size(bytes)));
                 }
+                lines.push(Line::from(what).fg(c.dim));
             }
+            lines.push(match app.downloads.get(&video.id) {
+                Some(Download::Getting { got, of: Some(of) }) if *of > 0 => {
+                    Line::from(format!("Downloading {}%", got * 100 / of)).fg(c.dim)
+                }
+                Some(Download::Getting { got, .. }) => {
+                    Line::from(format!("Downloading {}", size(*got))).fg(c.dim)
+                }
+                Some(Download::Ready(_)) => Line::from("Ready to play").fg(c.ok),
+                Some(Download::Streams) => Line::from("Too big to download: streams").fg(c.dim),
+                Some(Download::Failed(e)) => Line::from(format!("Download failed: {e}")).fg(c.red),
+                None => Line::from("Waiting to download").fg(c.dim),
+            });
             lines
         }
         None => {
@@ -224,6 +254,8 @@ pub fn size(bytes: u64) -> String {
 
 #[cfg(test)]
 pub mod tests {
+    use std::path::PathBuf;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -250,6 +282,7 @@ pub mod tests {
                 bytes: Some(779_704),
                 urls: vec!["https://v16-webapp-prime.tiktok.com/x".into()],
             }],
+            token: None,
         }
     }
 
@@ -269,8 +302,8 @@ pub mod tests {
 
     #[test]
     fn with_no_videos_the_box_says_why() {
-        let mut app = App::new(false, Vec::new(), Default::default());
-        app.cell = (9, 18);
+        let mut app = crate::app::tests::app_with(Vec::new());
+        app.feed = FeedState::NoBrowser;
         let text = screen(&app, 120, 40);
         assert!(text.contains("No videos yet"));
         assert!(text.contains(" tuitok "));
@@ -281,8 +314,8 @@ pub mod tests {
     }
 
     #[test]
-    fn a_video_shows_its_author_caption_counts_and_rendition() {
-        let app = crate::app::tests::app_with(vec![video("1"), video("2")]);
+    fn a_video_shows_its_author_caption_counts_rendition_and_download() {
+        let mut app = crate::app::tests::app_with(vec![video("1"), video("2")]);
         let text = screen(&app, 120, 40);
         for shown in [
             "@someone",
@@ -290,6 +323,10 @@ pub mod tests {
             "first line",
             "second line",
             "♫ original sound",
+            "1:15 · 1 of 2",
+            "H.265 720×1280 · 780 KB",
+            "Waiting to download",
+            "2 new videos · Lightpanda · 17 s",
         ] {
             assert!(text.contains(shown), "{shown}");
         }
@@ -297,16 +334,38 @@ pub mod tests {
         for shown in ["1.2K plays", "56 likes", "2.5M", "shares"] {
             assert!(text.contains(shown), "{shown}");
         }
-        assert!(text.contains("1:15 · 1 of 2"));
-        assert!(text.contains("H.265 720×1280"));
-        assert!(text.contains("780 KB"));
-        assert!(text.contains("2 new videos · Lightpanda · 17 s"));
+        let id = VideoId::new("1").unwrap();
+        for (state, shown) in [
+            (
+                Download::Getting {
+                    got: 390_000,
+                    of: Some(779_704),
+                },
+                "Downloading 50%",
+            ),
+            (
+                Download::Getting {
+                    got: 390_000,
+                    of: None,
+                },
+                "Downloading 390 KB",
+            ),
+            (Download::Ready(PathBuf::from("/x.mp4")), "Ready to play"),
+            (Download::Streams, "Too big to download: streams"),
+            (
+                Download::Failed("HTTP 403".into()),
+                "Download failed: HTTP 403",
+            ),
+        ] {
+            app.downloads.insert(id.clone(), state);
+            assert!(screen(&app, 120, 40).contains(shown), "{shown}");
+        }
     }
 
     #[test]
     fn a_narrow_window_has_no_panel() {
-        let mut app = App::new(true, Vec::new(), Default::default());
-        app.cell = (9, 18);
+        let mut app = crate::app::tests::app_with(Vec::new());
+        app.pepper = true;
         let text = screen(&app, 60, 30);
         assert!(text.contains("No videos yet"));
         assert!(!text.contains(" tuitok "));

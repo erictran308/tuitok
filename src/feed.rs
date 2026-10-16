@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -45,7 +46,7 @@ const NO_PLAY: &str =
 pub struct Batch {
     pub videos: Vec<Video>,
     /// The guest cookie the videos' addresses need, if the browser got one.
-    pub token: Option<String>,
+    pub token: Option<Arc<str>>,
     pub engine: Engine,
     pub took: Duration,
     /// Why an engine before it failed, if one did.
@@ -109,7 +110,7 @@ pub async fn fetch(engine: Engine, program: &Path, profile: &Path, want: usize) 
     })
 }
 
-async fn read(browser: &mut Browser, want: usize) -> Result<(Vec<Video>, Option<String>)> {
+async fn read(browser: &mut Browser, want: usize) -> Result<(Vec<Video>, Option<Arc<str>>)> {
     let engine = browser.engine;
     let cdp = &browser.cdp;
     let events = &mut browser.events;
@@ -217,7 +218,11 @@ async fn read(browser: &mut Browser, want: usize) -> Result<(Vec<Video>, Option<
             s,
         )
         .await?;
-    Ok((videos, chain_token(&cookies)))
+    let token: Option<Arc<str>> = chain_token(&cookies).map(Arc::from);
+    for video in &mut videos {
+        video.token = token.clone();
+    }
+    Ok((videos, token))
 }
 
 /// What's refused: pictures, fonts and media before they're asked for, and
