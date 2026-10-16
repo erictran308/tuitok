@@ -3,18 +3,20 @@
 //! caption, sound, counts, where it's at and top comments, then the keys and
 //! the feed's state on the bottom line. Until a video plays in Pepper's box,
 //! the box shows its cover, with under it what plays and how it's going.
+//! `?` opens a popup over it all: every key, and the settings.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 
-use crate::app::{App, FeedState};
+use crate::app::{App, FeedState, HelpMenu, HelpTab};
 use crate::cache::Download;
 use crate::comments::Comments;
 use crate::covers::Cover;
 use crate::pepper;
+use crate::theme;
 use crate::video::{Video, VideoId};
 
 /// The panel beside the video, in columns, shown in windows at least
@@ -107,6 +109,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_panel(frame, app, panel);
     }
     draw_bottom(frame, app, areas.bottom);
+    if let Some(menu) = &app.help {
+        draw_help(frame, app, menu, area);
+    }
 }
 
 /// In the box, centred: what would play and how its download is going, or
@@ -165,6 +170,9 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
         }) => Some(encoded),
         _ => None,
     });
+    // Sixel and iTerm2 pictures paint over what's drawn on them later: none
+    // under the popup (as in tuitube).
+    let cover = cover.filter(|_| app.help.is_none() || !app.pictures_paint_over());
     let picture = cover_area(area, app.demo);
     match cover {
         Some(encoded) if encoded.size == (picture.width, picture.height) && picture.height > 0 => {
@@ -254,16 +262,26 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             if !counts.is_empty() {
                 lines.push(Line::from(counts).fg(c.dim));
             }
-            let at = format!("{} of {}", app.at + 1, app.videos.len());
-            match position(app, v) {
+            let (when, bar) = match position(app, v) {
                 Some((position, length, paused)) => {
                     let paused = if paused { " · paused" } else { "" };
-                    let when = format!("{} / {}{paused} · {at}", clock(position), clock(length));
-                    lines.push(Line::from(when).fg(c.dim));
-                    lines.push(progress(app, position, length, width));
+                    let when = format!("{} / {}{paused}", clock(position), clock(length));
+                    (when, Some(progress(app, position, length, width)))
                 }
-                None => lines.push(Line::from(format!("{} · {at}", clock(v.seconds))).fg(c.dim)),
+                None => (clock(v.seconds), None),
+            };
+            let mut spans = vec![Span::from(format!("{when} · ")).fg(c.dim)];
+            // How loud, only when it isn't full; muted in the warning colour.
+            if app.muted {
+                spans.push(Span::from("muted").fg(c.warning));
+                spans.push(Span::from(" · ").fg(c.dim));
+            } else if app.volume < 100 {
+                spans.push(Span::from(format!("volume {}% · ", app.volume)).fg(c.dim));
             }
+            let at = format!("{} of {}", app.at + 1, app.videos.len());
+            spans.push(Span::from(at).fg(c.dim));
+            lines.push(Line::from(spans));
+            lines.extend(bar);
             if let Some(name) = app.behind_multiplexer {
                 lines.push(Line::default());
                 lines.push(Line::from(behind(name)).fg(c.subtext));
@@ -304,6 +322,131 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Every key, for the `?` popup's first tab.
+const KEYS: [(&str, &str); 9] = [
+    ("j  ↓", "the next video"),
+    ("k  ↑", "the one before"),
+    ("Space", "pause or play"),
+    ("h l  ← →  , .", "back or on 5 s"),
+    (
+        "-  +  /  m",
+        "volume down or up (kept for next time)  /  mute",
+    ),
+    (
+        "f",
+        "fill the tab in Pepper; elsewhere, mpv's window the screen",
+    ),
+    ("r", "fetch more videos now"),
+    ("?", "these keys, and the settings: the theme"),
+    ("q  Esc  Ctrl-c", "quit"),
+];
+
+/// The `?` popup, centered, as tuitube's: a tab with every key, and one
+/// with the settings; its own keys along its bottom border.
+fn draw_help(frame: &mut Frame, app: &App, menu: &HelpMenu, area: Rect) {
+    let c = &app.colors;
+    let keys = key_lines(c);
+    let (settings, cursor) = settings_lines(app, menu);
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (widest(&keys).max(widest(&settings)) + 3).min(usize::from(area.width)) as u16;
+    let height = (keys.len().max(settings.len()) as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let tab = |label: &'static str, active: bool| {
+        if active {
+            Span::from(label).fg(c.bg).bg(c.accent).bold()
+        } else {
+            Span::from(label).fg(c.dim)
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::raw(" "),
+        tab(" Keys ", menu.tab == HelpTab::Keys),
+        Span::raw(" "),
+        tab(" Settings ", menu.tab == HelpTab::Settings),
+        Span::raw(" "),
+    ]);
+    let hint = match menu.tab {
+        HelpTab::Keys => [("j k", "scroll"), ("Tab", "settings"), ("Esc", "close")],
+        HelpTab::Settings => [("Enter", "use"), ("Tab", "keys"), ("Esc", "close")],
+    };
+    let mut spans = vec![Span::raw(" ")];
+    for (n, (key, what)) in hint.into_iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::from(" · ").fg(c.dim));
+        }
+        spans.push(Span::from(key).fg(c.accent).bold());
+        spans.push(Span::from(format!(" {what}")).fg(c.dim));
+    }
+    spans.push(Span::raw(" "));
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(c.accent))
+        .title(tabs)
+        .title_bottom(Line::from(spans).right_aligned())
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = usize::from(inner.height);
+    let (lines, scroll) = match menu.tab {
+        HelpTab::Keys => {
+            // Kept in range here: the keys stop at the end of the list.
+            let scroll = menu.scroll.get().min(keys.len().saturating_sub(rows));
+            menu.scroll.set(scroll);
+            (keys, scroll)
+        }
+        // As little as keeps the cursor in view.
+        HelpTab::Settings => (settings, (cursor + 1).saturating_sub(rows)),
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+}
+
+/// The keys tab: every key, and what it does.
+fn key_lines(c: &theme::Colors) -> Vec<Line<'static>> {
+    let key_width = KEYS.iter().map(|(k, _)| Span::raw(*k).width()).max();
+    KEYS.iter()
+        .map(|(key, what)| {
+            let pad = " ".repeat(key_width.unwrap_or(0) - Span::raw(*key).width());
+            Line::from(vec![
+                Span::from(format!(" {key}{pad}  ")).fg(c.accent),
+                Span::from(*what).fg(c.text),
+            ])
+        })
+        .collect()
+}
+
+/// The settings tab: the themes, the one in use dotted, the one under the
+/// cursor lit; and the line the cursor is on.
+fn settings_lines(app: &App, menu: &HelpMenu) -> (Vec<Line<'static>>, usize) {
+    let c = &app.colors;
+    let mut lines = vec![Line::from(" Theme").fg(c.dim).bold()];
+    let mut cursor = 0;
+    for (row, (id, name)) in theme::names().iter().enumerate() {
+        let chosen = row == menu.selected;
+        let line = Line::from(vec![
+            Span::from(if chosen { "▌" } else { " " }).fg(c.accent),
+            Span::from(if *id == app.theme { " ● " } else { " ○ " }).fg(c.accent),
+            Span::from(name.clone()).fg(c.text),
+        ]);
+        if chosen {
+            cursor = lines.len();
+            lines.push(line.bg(c.selected));
+        } else {
+            lines.push(line);
+        }
+    }
+    if let Some(e) = &menu.error {
+        lines.push(Line::default());
+        lines.push(Line::from(format!(" {e}")).fg(c.red));
+    }
+    (lines, cursor)
+}
+
 /// Where the video shown is, how long it is, and whether it's paused,
 /// while it plays (made up in the demo).
 fn position(app: &App, video: &Video) -> Option<(u32, u32, bool)> {
@@ -335,24 +478,43 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     let width = (status.width() as u16).min(area.width / 2);
     let [keys, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(width + 1)]).areas(area);
-    frame.render_widget(Paragraph::new(hints(app)), keys);
+    frame.render_widget(Paragraph::new(hints(app, keys.width)), keys);
     frame.render_widget(Paragraph::new(status).alignment(Alignment::Right), right);
 }
 
-/// The keys, each in the accent colour, what it does dimmed.
-fn hints(app: &App) -> Line<'static> {
+/// The keys, each in the accent colour, what it does dimmed. The last is
+/// always there; one before it that doesn't fit in `width` is left out
+/// whole, and a shorter one after it can still fit.
+fn hints(app: &App, width: u16) -> Line<'static> {
     let c = &app.colors;
-    let mut spans = Vec::new();
-    for (keys, what) in [
+    let keys = [
         ("j k", "next/back"),
         ("space", "pause"),
         ("m", "mute"),
+        ("- +", "volume"),
         ("f", "fill"),
+        ("?", "help"),
         ("r", "more"),
         ("q", "quit"),
-    ] {
+    ];
+    // The last (how to quit) is always there; the others fit in before it.
+    // All ASCII: bytes are cells.
+    let (last, rest) = keys.split_last().expect("there are hints");
+    let wide = |(keys, what): &(&str, &str)| 2 + keys.len() + 1 + what.len();
+    // The first one's gap is one space, not two.
+    let mut room = (usize::from(width) + 1).saturating_sub(wide(last));
+    let mut shown = Vec::new();
+    for hint in rest {
+        if wide(hint) <= room {
+            room -= wide(hint);
+            shown.push(hint);
+        }
+    }
+    shown.push(last);
+    let mut spans = Vec::new();
+    for (keys, what) in shown {
         spans.push(Span::from(if spans.is_empty() { " " } else { "  " }));
-        spans.push(Span::from(keys).fg(c.accent));
+        spans.push(Span::from(*keys).fg(c.accent));
         spans.push(Span::from(format!(" {what}")).fg(c.dim));
     }
     Line::from(spans)
@@ -488,8 +650,15 @@ pub mod tests {
         assert!(text.contains("╭  ♪  tuitok ─"));
         assert!(text.contains("Not in Pepper"));
         let last = text.lines().last().unwrap();
-        assert!(last.starts_with(" j k next/back  space pause  m mute  f fill  r more  q quit"));
+        // The status is long: the hints that don't fit are left out, but
+        // not how to quit.
+        assert!(last.starts_with(" j k next/back  space pause  m mute  - + volume  q quit"));
         assert!(last.contains("No browser for the feed"));
+        app.feed = FeedState::Failed("x".into());
+        let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
+        assert!(last.starts_with(
+            " j k next/back  space pause  m mute  - + volume  f fill  ? help  r more  q quit"
+        ));
     }
 
     #[test]
@@ -556,6 +725,12 @@ pub mod tests {
         let text = screen(&app, 120, 40);
         assert!(!text.contains("Playing in mpv's window") && !text.contains("H.265"));
         assert!(text.contains("0:03 / 1:15 · paused · 1 of 2"));
+        // How loud, when it isn't full.
+        app.volume = 80;
+        assert!(screen(&app, 120, 40).contains("0:03 / 1:15 · paused · volume 80% · 1 of 2"));
+        app.muted = true;
+        assert!(screen(&app, 120, 40).contains("0:03 / 1:15 · paused · muted · 1 of 2"));
+        app.muted = false;
         // Why a video doesn't play.
         app.playing = None;
         app.play_error = Some("It can't play: loading failed".into());
@@ -644,6 +819,54 @@ pub mod tests {
         let text = screen(&app, 60, 30);
         assert!(text.contains("No videos yet"));
         assert!(!text.contains("tuitok ─"));
+    }
+
+    #[test]
+    fn the_popup_lists_every_key_then_the_settings() {
+        use std::cell::Cell;
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        app.help = Some(HelpMenu {
+            tab: HelpTab::Keys,
+            scroll: Cell::new(99),
+            selected: 1,
+            error: None,
+        });
+        let text = screen(&app, 120, 40);
+        let line = |text: &str, shown: &str| {
+            text.lines()
+                .find(|line| line.contains(shown))
+                .unwrap_or_else(|| panic!("{shown}\n{text}"))
+                .to_owned()
+        };
+        assert!(line(&text, " Keys ").contains(" Settings "), "the tabs");
+        for (key, what) in KEYS {
+            assert!(line(&text, what).contains(key), "{key}");
+        }
+        assert!(text.contains("j k scroll · Tab settings · Esc close"));
+        assert_eq!(app.help.as_ref().unwrap().scroll.get(), 0, "kept in range");
+        // The panel's still there, under it; the bottom line names `?`.
+        assert!(text.contains("@someone"));
+        assert!(text.lines().last().unwrap().contains("? help"));
+        // The settings tab: the theme in use dotted, the cursor's lit.
+        let menu = app.help.as_mut().unwrap();
+        menu.tab = HelpTab::Settings;
+        menu.error = Some("settings.toml isn't valid TOML, so it wasn't changed".into());
+        let text = screen(&app, 120, 40);
+        assert!(
+            line(&text, "Catppuccin Frappé").contains("▌ ○"),
+            "the cursor"
+        );
+        assert!(
+            line(&text, "Catppuccin Mocha").contains(" ● "),
+            "the one in use"
+        );
+        assert!(text.contains("Rosé Pine") && text.contains("isn't valid TOML"));
+        assert!(text.contains("Enter use · Tab keys · Esc close"));
+        assert!(!text.contains("the next video"));
+        // A short window: the cursor kept in view.
+        app.help.as_mut().unwrap().selected = theme::names().len() - 1;
+        let text = screen(&app, 120, 8);
+        assert!(line(&text, "Rosé Pine").contains("▌"));
     }
 
     #[test]

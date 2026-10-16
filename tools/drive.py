@@ -8,7 +8,8 @@ or plays aloud.
     uv run --no-project --with pyte python -I tools/drive.py target/debug/tuitok [WAIT] [KEY:SECONDS ...]
 
 WAIT is how long to let it fetch first (40 s); each KEY is pressed, then
-SECONDS waited (`j:6 space:2`; `space` is a space). `q` is pressed last.
+SECONDS waited (`j:6 space:2`; `space`, `enter`, `esc` and `tab` are those keys).
+`q` is pressed last.
 """
 
 import fcntl
@@ -24,7 +25,7 @@ import time
 import pyte
 
 COLS, ROWS = 150, 45
-KEYS = {"space": b" ", "down": b"\x1b[B", "up": b"\x1b[A"}
+KEYS = {"space": b" ", "down": b"\x1b[B", "up": b"\x1b[A", "enter": b"\r", "esc": b"\x1b", "tab": b"\t"}
 
 
 def main():

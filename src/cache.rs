@@ -3,7 +3,8 @@
 //! batch got, into the session's cache folder (`config::Session`: only you
 //! can read it, and it's emptied when tuitok ends, so it keeps no record of
 //! what you watched). A video over `DOWNLOAD_UP_TO` isn't downloaded but
-//! streamed when it plays.
+//! streamed when it plays. A download that fails is tried again
+//! ([`retry_after`]); meanwhile the video streams if it's shown.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,17 @@ pub const DOWNLOAD_UP_TO: u64 = 30_000_000;
 
 /// How often a download says how far it's got.
 const REPORT_EVERY: u64 = 256 * 1024;
+
+/// Tries a download gets in all, and the wait before the second (the
+/// third waits twice that).
+pub const TRIES: u32 = 3;
+const RETRY_AFTER: Duration = Duration::from_secs(3);
+
+/// How long after its `failed`th failure a download is tried again: never
+/// once it has had its `TRIES`.
+pub fn retry_after(failed: u32) -> Option<Duration> {
+    (failed < TRIES).then(|| RETRY_AFTER * failed)
+}
 
 /// What TikTok's video hosts are sent besides the guest cookie: Chrome's
 /// user agent and TikTok as the referrer, as its own page sends (tested
@@ -245,6 +257,19 @@ mod tests {
         assert!(!is_mp4(b"\0\0\0\x20ftyp\x1b[2J"));
         assert!(!is_mp4(b"\0\0\0\x20ftyp"));
         assert!(is_mp4(b"\0\0\0\x18ftypmp42"));
+    }
+
+    #[test]
+    fn a_failed_download_waits_longer_each_time_then_stops() {
+        let waits: Vec<_> = (1..=TRIES).map(retry_after).collect();
+        assert_eq!(
+            waits,
+            [
+                Some(Duration::from_secs(3)),
+                Some(Duration::from_secs(6)),
+                None
+            ]
+        );
     }
 
     /// Against TikTok: `cargo test -- --ignored live`.

@@ -3,6 +3,7 @@
 //! progress and end, what the player says), a redraw after each, and after
 //! the frame, in Pepper, where the picture goes.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use futures::StreamExt;
 use image::DynamicImage;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
@@ -26,7 +27,8 @@ use crate::covers::{self, Cover, Encoded};
 use crate::demo;
 use crate::feed::{self, Batch};
 use crate::pepper::{self, Placed};
-use crate::player::{Kind, Player, PlayerEvent, Target};
+use crate::player::{Kind, Player, PlayerEvent, Sound, Target};
+use crate::settings::{self, Settings};
 use crate::text;
 use crate::theme::{self, Colors};
 use crate::ui;
@@ -51,8 +53,11 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Comments are fetched for the video shown and this many after it.
 const COMMENTS_AHEAD: usize = 1;
 
-/// How far `h` and `l` seek, in seconds.
+/// How far `h` and `l` (or ← and →, `,` and `.`) seek, in seconds.
 const SEEK: f64 = 5.0;
+
+/// How far `-` and `+` turn the volume down or up, in percent (tuitube's).
+const VOLUME_STEP: u32 = 5;
 
 const NO_PLAYER: &str = "No player: brew install mpv";
 
@@ -70,6 +75,9 @@ pub enum AppEvent {
     },
     /// A download ended: ready, to stream, or failed.
     Downloaded { id: VideoId, outcome: Download },
+    /// A failed download's wait is over: it's tried again
+    /// ([`App::try_again_later`]).
+    TryAgain(VideoId),
     /// A video's cover arrived and was decoded, or didn't.
     CoverFetched {
         id: VideoId,
@@ -112,8 +120,35 @@ enum Step {
     Mark(VideoId, Download),
 }
 
+/// The tabs of the `?` popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpTab {
+    Keys,
+    Settings,
+}
+
+/// The `?` popup, as tuitube's: every key, and the settings. On the
+/// settings tab, Enter or Space picks the theme under the cursor and saves
+/// it at once.
+#[derive(Debug, PartialEq)]
+pub struct HelpMenu {
+    pub tab: HelpTab,
+    /// The first line shown on the keys tab. Drawing keeps it in range.
+    pub scroll: Cell<usize>,
+    /// The row under the cursor on the settings tab, in `theme::names()`.
+    pub selected: usize,
+    /// Why the last theme picked couldn't be saved.
+    pub error: Option<String>,
+}
+
 pub struct App {
     pub colors: Colors,
+    /// The theme in use (its id in `theme::BUILT_IN`), the data folder
+    /// it's saved in when picked (none in the demo and tests), and the `?`
+    /// popup while it's open.
+    pub theme: &'static str,
+    settings_in: Option<PathBuf>,
+    pub help: Option<HelpMenu>,
     /// tuitok runs in Pepper (`pepper::port`).
     pub pepper: bool,
     /// A cell's size in pixels, and the terminal's size in cells: the box's
@@ -158,6 +193,15 @@ pub struct App {
     failed_at: Option<Instant>,
     /// Downloads running.
     running: usize,
+    /// How many times each video's download failed: it's tried again,
+    /// `cache::TRIES` in all.
+    failures: HashMap<VideoId, u32>,
+    /// How loud, in percent (`-` and `+`), what settings.toml has (it's
+    /// written when tuitok ends if that changed), and the sound off (`m`,
+    /// for this run).
+    pub volume: u32,
+    volume_kept: u32,
+    pub muted: bool,
     /// The program to play with and how (`main` decides: pepper-play in
     /// Pepper, else mpv's window), the player once started, how many have
     /// been started (each one's events carry its number), and what it was
@@ -209,6 +253,9 @@ impl App {
         };
         Self {
             colors: Colors::named(theme::DEFAULT),
+            theme: theme::DEFAULT,
+            settings_in: None,
+            help: None,
             pepper,
             cell: cell_size(),
             size: crossterm::terminal::size().unwrap_or(GUESSED_SIZE),
@@ -235,6 +282,10 @@ impl App {
             cookies: Vec::new(),
             failed_at: None,
             running: 0,
+            failures: HashMap::new(),
+            volume: 100,
+            volume_kept: 100,
+            muted: false,
             player_with,
             player: None,
             players: 0,
@@ -301,14 +352,18 @@ impl App {
         self.videos.get(self.at)
     }
 
-    /// The video box, laid out as `ui::draw` lays it out.
-    fn video_area(&self) -> Rect {
+    /// Where things go, laid out as `ui::draw` lays them out.
+    fn areas(&self) -> ui::Areas {
         ui::areas(
             Rect::new(0, 0, self.size.0, self.size.1),
             self.cell,
             self.fullscreen,
         )
-        .video
+    }
+
+    /// The video box.
+    fn video_area(&self) -> Rect {
+        self.areas().video
     }
 
     /// The video box's size in pixels.
@@ -324,6 +379,17 @@ impl App {
     fn cover_size(&self) -> (u16, u16) {
         let area = ui::cover_area(self.video_area(), self.demo);
         (area.width, area.height)
+    }
+
+    /// Whether the terminal paints each picture over what's drawn on it
+    /// later (sixel, iTerm2's protocol), so none may go under a popup.
+    pub fn pictures_paint_over(&self) -> bool {
+        self.picker.as_ref().is_some_and(|picker| {
+            matches!(
+                picker.protocol_type(),
+                ProtocolType::Sixel | ProtocolType::Iterm2
+            )
+        })
     }
 
     /// Sets how pictures are drawn, and takes the cell size it found if the
@@ -392,6 +458,20 @@ impl App {
         }
     }
 
+    /// The settings read at the start, and the data folder to save them in
+    /// (none: what's picked is kept for this run only).
+    pub fn use_settings(&mut self, settings: Settings, save_in: Option<PathBuf>) {
+        self.set_theme(settings.theme);
+        self.volume = settings.volume;
+        self.volume_kept = settings.volume;
+        self.settings_in = save_in;
+    }
+
+    fn set_theme(&mut self, id: &'static str) {
+        self.theme = id;
+        self.colors = Colors::named(id);
+    }
+
     /// How many videos the batch being fetched has added so far.
     pub fn found_so_far(&self) -> usize {
         self.videos.len() - self.batch_from
@@ -402,9 +482,10 @@ impl App {
         self.playing.is_some() && self.playing.as_ref() == self.current().map(|v| &v.id)
     }
 
-    /// Whether that picture is in Pepper's box (not in mpv's window).
+    /// Whether that picture is in Pepper's box (not in mpv's window): not
+    /// while the `?` popup is open, which it would cover (as in tuitube).
     pub fn picture_in_box(&self) -> bool {
-        self.shows_picture() && self.token.is_some()
+        self.shows_picture() && self.token.is_some() && self.help.is_none()
     }
 
     /// Whether the player was told to play the video shown and has no
@@ -509,10 +590,14 @@ impl App {
             }
             AppEvent::Downloaded { id, outcome } => {
                 self.running = self.running.saturating_sub(1);
+                if matches!(outcome, Download::Failed(_)) {
+                    self.try_again_later(&id);
+                }
                 self.downloads.insert(id, outcome);
                 self.prefetch();
                 self.play_current();
             }
+            AppEvent::TryAgain(id) => self.try_again(&id),
             AppEvent::CoverFetched { id, picture } => {
                 let cover = match picture {
                     Ok(picture) => Cover::Ready {
@@ -599,6 +684,9 @@ impl App {
             PlayerEvent::Position(seconds) => self.position = seconds,
             PlayerEvent::Duration(seconds) => self.duration = Some(seconds),
             PlayerEvent::Paused(paused) => self.paused = paused,
+            // Changed in mpv's window too: the next video plays as loud.
+            PlayerEvent::Volume(volume) => self.volume = volume.round().clamp(0.0, 100.0) as u32,
+            PlayerEvent::Muted(muted) => self.muted = muted,
             PlayerEvent::Failed(e) => {
                 self.playing = None;
                 self.play_error = Some(format!("It can't play: {e}"));
@@ -689,7 +777,11 @@ impl App {
                 event,
             });
         };
-        match Player::start(&program, &kind, said) {
+        let sound = Sound {
+            volume: self.volume,
+            muted: self.muted,
+        };
+        match Player::start(&program, &kind, sound, said) {
             Ok(player) => {
                 self.token = player.token.clone();
                 self.player = Some(player);
@@ -710,7 +802,7 @@ impl App {
         let want = self
             .token
             .clone()
-            .filter(|_| self.shows_picture())
+            .filter(|_| self.picture_in_box())
             .map(|token| Placed {
                 token,
                 area: self.video_area(),
@@ -808,6 +900,38 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A download failed: it's tried again after `cache::retry_after`,
+    /// `cache::TRIES` in all. Meanwhile the video streams if it's shown.
+    fn try_again_later(&mut self, id: &VideoId) {
+        let failed = {
+            let failed = self.failures.entry(id.clone()).or_default();
+            *failed += 1;
+            *failed
+        };
+        let (Some(wait), Some(tx)) = (cache::retry_after(failed), self.tx.clone()) else {
+            return;
+        };
+        let id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = tx.send(AppEvent::TryAgain(id));
+        });
+    }
+
+    /// Downloads a video again once its wait is over, unless it plays
+    /// streamed meanwhile (it's shown), or its download isn't failed any
+    /// more (pruned, or downloaded again on the way back to it).
+    fn try_again(&mut self, id: &VideoId) {
+        if self.loaded.as_ref() == Some(id)
+            || !matches!(self.downloads.get(id), Some(Download::Failed(_)))
+        {
+            return;
+        }
+        self.downloads.remove(id);
+        self.prefetch();
+        self.play_current();
     }
 
     /// Deletes the downloads more than `cache::BEHIND` before the video
@@ -928,22 +1052,148 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        if self.help.is_some() {
+            self.on_help_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.go(1),
             KeyCode::Char('k') | KeyCode::Up => self.go(-1),
             KeyCode::Char(' ') => self.with_player(Player::toggle_pause),
-            KeyCode::Char('m') => self.with_player(Player::toggle_mute),
-            KeyCode::Char('h') | KeyCode::Left => self.with_player(|p| p.seek(-SEEK)),
-            KeyCode::Char('l') | KeyCode::Right => self.with_player(|p| p.seek(SEEK)),
+            KeyCode::Char('m') => self.set_muted(!self.muted),
+            KeyCode::Char('-') => self.set_volume(self.volume.saturating_sub(VOLUME_STEP)),
+            KeyCode::Char('+' | '=') => self.set_volume(self.volume + VOLUME_STEP),
+            KeyCode::Char('h' | ',') | KeyCode::Left => self.with_player(|p| p.seek(-SEEK)),
+            KeyCode::Char('l' | '.') | KeyCode::Right => self.with_player(|p| p.seek(SEEK)),
             KeyCode::Char('f') => self.toggle_fullscreen(),
+            KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('r') => {
                 self.failed_at = None;
                 self.fetch_more();
             }
             _ => {}
         }
+    }
+
+    /// `?`: the popup, on its keys tab, the settings' cursor on the theme in
+    /// use.
+    fn open_help(&mut self) {
+        let selected = theme::names()
+            .iter()
+            .position(|(id, _)| *id == self.theme)
+            .unwrap_or(0);
+        self.help = Some(HelpMenu {
+            tab: HelpTab::Keys,
+            scroll: Cell::new(0),
+            selected,
+            error: None,
+        });
+    }
+
+    /// Keys while the `?` popup is open, as tuitube's: Tab (or `h` `l`, ←
+    /// →) the other tab, `j` `k` scroll the keys or move the settings'
+    /// cursor, Enter or Space pick the theme under it, Esc, `q` or `?` close.
+    fn on_help_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.help.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h' | 'l')
+            | KeyCode::Left
+            | KeyCode::Right => {
+                menu.tab = match menu.tab {
+                    HelpTab::Keys => HelpTab::Settings,
+                    HelpTab::Settings => HelpTab::Keys,
+                };
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if menu.tab == HelpTab::Settings => {
+                let row = menu.selected;
+                self.pick_theme(row);
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('q' | '?') => {
+                self.help = None;
+                return;
+            }
+            _ => {}
+        }
+        let delta: isize = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::Char('g') | KeyCode::Home => isize::MIN,
+            KeyCode::Char('G') | KeyCode::End => isize::MAX,
+            _ => return,
+        };
+        match menu.tab {
+            // Drawing stops it at the end of the list.
+            HelpTab::Keys => menu
+                .scroll
+                .set(menu.scroll.get().saturating_add_signed(delta)),
+            HelpTab::Settings => {
+                let last = theme::names().len() - 1;
+                menu.selected = menu.selected.saturating_add_signed(delta).min(last);
+            }
+        }
+    }
+
+    /// Enter or Space on the settings tab: the theme on `row` in use, and
+    /// saved at once; why not, if it can't be.
+    fn pick_theme(&mut self, row: usize) {
+        let Some((id, _)) = theme::names().get(row) else {
+            return;
+        };
+        self.set_theme(id);
+        let saved = self.save_theme();
+        if let Some(menu) = &mut self.help {
+            menu.error = saved.err();
+        }
+    }
+
+    /// `-` and `+`: how loud, in percent, what plays and what plays next,
+    /// and the sound on again, as YouTube's player does (tuitube's way).
+    fn set_volume(&mut self, volume: u32) {
+        self.volume = volume.min(100);
+        self.muted = false;
+        if let Some(player) = &self.player {
+            player.set_volume(self.volume);
+            player.set_muted(false);
+        }
+    }
+
+    /// `m`: the sound off, or on again, for this run.
+    fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if let Some(player) = &self.player {
+            player.set_muted(muted);
+        }
+    }
+
+    /// When tuitok ends: the volume kept in settings.toml if it changed in
+    /// this run (not in the demo).
+    pub fn keep_volume(&self) -> anyhow::Result<()> {
+        match &self.settings_in {
+            Some(data) if self.volume != self.volume_kept => {
+                settings::save(data, "volume", i64::from(self.volume).into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Keeps the theme in use in settings.toml, if there's a folder for it.
+    fn save_theme(&self) -> Result<(), String> {
+        let Some(data) = &self.settings_in else {
+            return Ok(());
+        };
+        settings::save(data, "theme", self.theme.into())
+            .map_err(|e| text::one_line(&format!("{e:#}"), 200))
     }
 
     /// `act` on the player, while it shows the video shown.
@@ -1312,6 +1562,140 @@ pub mod tests {
         assert_eq!(app.placement(), "");
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_failed_download_is_tried_again_unless_it_streams_meanwhile() {
+        let mut app = app_with(vec![
+            crate::ui::tests::video("1"),
+            crate::ui::tests::video("2"),
+        ]);
+        let (one, two) = (VideoId::new("1").unwrap(), VideoId::new("2").unwrap());
+        let failed = |id: &VideoId| AppEvent::Downloaded {
+            id: id.clone(),
+            outcome: Download::Failed("HTTP 503".into()),
+        };
+        app.downloads
+            .insert(one.clone(), Download::Ready("/nowhere/cache/1.mp4".into()));
+        app.on_app_event(failed(&two));
+        assert_eq!(app.failures[&two], 1);
+        // Its wait is over: downloaded again.
+        app.on_app_event(AppEvent::TryAgain(two.clone()));
+        assert!(!app.downloads.contains_key(&two));
+        assert!(matches!(&app.plan()[..], [Step::Start(job)] if job.id == two));
+        app.on_app_event(failed(&two));
+        assert_eq!(app.failures[&two], 2);
+        // Shown and streamed meanwhile: not downloaded as well.
+        app.loaded = Some(two.clone());
+        app.on_app_event(AppEvent::TryAgain(two.clone()));
+        assert!(matches!(app.downloads[&two], Download::Failed(_)));
+        // One that isn't failed any more is left as it is.
+        app.on_app_event(AppEvent::TryAgain(one.clone()));
+        assert!(matches!(app.downloads[&one], Download::Ready(_)));
+    }
+
+    #[test]
+    fn question_mark_opens_the_keys_and_the_settings_pick_a_theme_at_once() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        let data = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/test-app-settings-{}", std::process::id()));
+        crate::config::private_dir(&data).unwrap();
+        let nord = Settings {
+            theme: "nord",
+            ..Settings::default()
+        };
+        app.use_settings(nord, Some(data.clone()));
+        assert_eq!(app.colors, Colors::named("nord"));
+        press(&mut app, KeyCode::Char('?'));
+        let menu = app.help.as_ref().unwrap();
+        assert_eq!(menu.tab, HelpTab::Keys);
+        assert_eq!(
+            theme::names()[menu.selected].0,
+            "nord",
+            "on the theme in use"
+        );
+        // While it's open, the keys are its own.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.fullscreen && app.at == 0);
+        assert_eq!(app.help.as_ref().unwrap().scroll.get(), 1);
+        // Enter on the keys tab does nothing; on the settings tab it picks
+        // the theme under the cursor and saves it, and the popup stays.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.theme, "nord");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Enter);
+        let before_nord = theme::names()[theme::names().len() - 3].0;
+        assert_eq!(app.help.as_ref().unwrap().tab, HelpTab::Settings);
+        assert_eq!(
+            (app.theme, settings::load(&data).theme),
+            (before_nord, before_nord)
+        );
+        assert_eq!(app.colors, Colors::named(before_nord));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            app.help.as_ref().unwrap().selected,
+            theme::names().len() - 1
+        );
+        // q closes it, and doesn't quit; it kept what was picked.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.help.is_none() && !app.quit);
+        assert_eq!(app.theme, before_nord);
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn the_volume_goes_by_5_unmutes_and_is_kept_when_it_changed() {
+        let mut app = app_with(Vec::new());
+        let data = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/test-app-volume-{}", std::process::id()));
+        crate::config::private_dir(&data).unwrap();
+        let at = |volume| Settings {
+            theme: theme::DEFAULT,
+            volume,
+        };
+        app.use_settings(at(100), Some(data.clone()));
+        // Unchanged: nothing written.
+        app.keep_volume().unwrap();
+        assert!(!data.join("settings.toml").exists());
+        press(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.volume, 100, "no louder than 100");
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.muted);
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!((app.volume, app.muted), (90, false));
+        press(&mut app, KeyCode::Char('='));
+        assert_eq!(app.volume, 95);
+        app.keep_volume().unwrap();
+        assert_eq!(settings::load(&data).volume, 95);
+        // Changed in mpv's window: followed, within 0 to 100.
+        app.players = 1;
+        for (said, volume) in [(42.4, 42), (130.0, 100)] {
+            app.on_app_event(AppEvent::Player {
+                player: 1,
+                event: PlayerEvent::Volume(said),
+            });
+            assert_eq!(app.volume, volume);
+        }
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn the_popup_takes_the_picture_away() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        set_playing(&mut app, "1", true);
+        let area = app.video_area();
+        assert_eq!(app.placement(), pepper::place("t0k", area));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(!app.picture_in_box());
+        assert_eq!(app.placement(), pepper::remove("t0k"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+    }
     #[test]
     fn the_players_words() {
         let mut app = app_with(vec![crate::ui::tests::video("1")]);

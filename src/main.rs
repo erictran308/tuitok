@@ -14,6 +14,7 @@ mod feed;
 mod guest;
 mod pepper;
 mod player;
+mod settings;
 mod text;
 mod theme;
 mod tmux;
@@ -41,7 +42,8 @@ Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --forget | --he
   --version   print tuitok's version
 
 Keys: j or ↓ the next video, k or ↑ the one before, space pause, m mute,
-h or ← and l or → back and on 5 s, f fill the tab, r fetch more, q quit.
+- and + the volume down and up, h, ← or , and l, → or . back and on 5 s,
+f fill the tab, ? every key and the settings (the theme), r fetch more, q quit.
 
 tuitok isn't made or endorsed by TikTok or ByteDance.";
 
@@ -124,6 +126,7 @@ fn run() -> ExitCode {
     // The last run's guest: the same TikTok guest goes on, and what was
     // watched isn't shown again.
     app.carry_in(guest::load(&session.data));
+    app.use_settings(settings::load(&session.data), Some(session.data.clone()));
     let mut terminal = ratatui::init();
     start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));
@@ -135,6 +138,12 @@ fn run() -> ExitCode {
     if let Err(e) = guest::save(&session.data, &app.carry_out()) {
         eprintln!(
             "tuitok: couldn't keep the guest for next time: {}",
+            text::one_line(&format!("{e:#}"), 300)
+        );
+    }
+    if let Err(e) = app.keep_volume() {
+        eprintln!(
+            "tuitok: couldn't keep the volume for next time: {}",
             text::one_line(&format!("{e:#}"), 300)
         );
     }
@@ -153,6 +162,10 @@ fn run_demo() -> ExitCode {
         Err(e) => return fail(&e.into()),
     };
     let mut app = app::App::demo(pepper::port().is_some());
+    // Your theme, but nothing is saved: the demo makes no folder.
+    if let Ok(data) = config::data_dir_path() {
+        app.use_settings(settings::load(&data), None);
+    }
     let mut terminal = ratatui::init();
     start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));

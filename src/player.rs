@@ -46,6 +46,13 @@ pub enum Target {
     },
 }
 
+/// How loud a player starts: the volume in percent, and whether it's muted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sound {
+    pub volume: u32,
+    pub muted: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum PlayerEvent {
     /// The first frame of what was loaded is ready.
@@ -53,6 +60,10 @@ pub enum PlayerEvent {
     Position(f64),
     Duration(f64),
     Paused(bool),
+    /// The volume, in percent, and the sound off or on: as tuitok set
+    /// them, or as they were changed in mpv's window.
+    Volume(f64),
+    Muted(bool),
     /// What was loaded can't play.
     Failed(String),
     /// The player is gone: its window closed, or it ended.
@@ -90,10 +101,12 @@ pub struct Player {
 }
 
 impl Player {
-    /// Starts `program` as `kind`; what it says goes to `events`.
+    /// Starts `program` as `kind`, as loud as `sound`; what it says goes to
+    /// `events`.
     pub fn start(
         program: &Path,
         kind: &Kind,
+        sound: Sound,
         events: impl Fn(PlayerEvent) + Send + 'static,
     ) -> Result<Self> {
         let token = match kind {
@@ -165,7 +178,17 @@ impl Player {
             events(PlayerEvent::Exited);
         });
         let player = Self { out, token, child };
-        for (id, name) in [(1, "time-pos"), (2, "duration"), (3, "pause")] {
+        // Before the volume is observed, so the first value it says is this.
+        player.set_volume(sound.volume);
+        player.set_muted(sound.muted);
+        let observed = [
+            (1, "time-pos"),
+            (2, "duration"),
+            (3, "pause"),
+            (4, "volume"),
+            (5, "mute"),
+        ];
+        for (id, name) in observed {
             player.command(json!(["observe_property", id, name]));
         }
         player.command(json!(["set_property", "user-agent", cache::USER_AGENT]));
@@ -209,8 +232,13 @@ impl Player {
         self.command(json!(["cycle", "pause"]));
     }
 
-    pub fn toggle_mute(&self) {
-        self.command(json!(["cycle", "mute"]));
+    /// Sets the volume, in percent.
+    pub fn set_volume(&self, percent: u32) {
+        self.command(json!(["set_property", "volume", percent.min(100)]));
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.command(json!(["set_property", "mute", muted]));
     }
 
     pub fn toggle_fullscreen(&self) {
@@ -267,6 +295,8 @@ fn parse(line: &str) -> Option<PlayerEvent> {
             "time-pos" => number(&message["data"]).map(PlayerEvent::Position),
             "duration" => number(&message["data"]).map(PlayerEvent::Duration),
             "pause" => message["data"].as_bool().map(PlayerEvent::Paused),
+            "volume" => number(&message["data"]).map(PlayerEvent::Volume),
+            "mute" => message["data"].as_bool().map(PlayerEvent::Muted),
             _ => None,
         },
         _ => None,
@@ -294,6 +324,14 @@ mod tests {
         assert_eq!(
             parse(r#"{"event":"property-change","name":"pause","data":true}"#),
             Some(PlayerEvent::Paused(true))
+        );
+        assert_eq!(
+            parse(r#"{"event":"property-change","id":4,"name":"volume","data":45.0}"#),
+            Some(PlayerEvent::Volume(45.0))
+        );
+        assert_eq!(
+            parse(r#"{"event":"property-change","id":5,"name":"mute","data":true}"#),
+            Some(PlayerEvent::Muted(true))
         );
         assert_eq!(
             parse(
@@ -326,7 +364,11 @@ mod tests {
         let video = &batch.videos[0];
         let rendition = video.best((608, 1080)).unwrap().clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let player = Player::start(&mpv, &Kind::Headless, move |event| {
+        let sound = Sound {
+            volume: 100,
+            muted: false,
+        };
+        let player = Player::start(&mpv, &Kind::Headless, sound, move |event| {
             let _ = tx.send(event);
         })
         .unwrap();

@@ -101,8 +101,10 @@ tuitok
 | `k` or `↑` | the one before |
 | `space` | pause |
 | `m` | mute |
-| `h` `l` or `←` `→` | back or on 5 s |
+| `-` `+` | volume down or up (kept for next time) |
+| `h` `l`, `←` `→` or `,` `.` | back or on 5 s |
 | `f` | the video fills the tab (Pepper), or mpv's window the screen |
+| `?` | every key, and the settings: `tab` to them, then pick a theme with `j` `k` and `enter` |
 | `r` | fetch more now |
 | `q` | quit |
 
@@ -117,7 +119,7 @@ tuitok
 ## Privacy and security
 
 - **No account.** tuitok never logs in. The feed is TikTok's logged-out For You: popular videos for your country, not yours.
-- **Little kept.** One small file, readable only by you, carries the guest from one run to the next: TikTok's guest cookies and the ids of the videos you watched (the newest 5,000), nothing else. `tuitok --forget` deletes it. Videos are downloaded into a folder of that run's only, readable only by you, and it's deleted when tuitok quits (or by the next run, if it crashed); covers and comments stay in memory.
+- **Little kept.** One small file, readable only by you, carries the guest from one run to the next: TikTok's guest cookies and the ids of the videos you watched (the newest 5,000), nothing else. `tuitok --forget` deletes it. Your theme and volume are kept in another, `settings.toml`. Videos are downloaded into a folder of that run's only, readable only by you, and it's deleted when tuitok quits (or by the next run, if it crashed); covers and comments stay in memory.
 - **The browser runs only while it fetches**, with a profile of that run's, pictures, video and sound refused, and Lightpanda's telemetry off.
 - **Only TikTok's own hosts** are fetched from, over https; redirects elsewhere are refused. Top comments come from TikTok's comment list, asked without any cookie. Text from TikTok is cleaned before it's shown, pictures are decoded only as JPEG within size limits, and downloaded videos must be MP4s.
 - **Nothing private on a command line.** The guest's cookies go only to the next batch's browser and to that file, and the one the videos need goes to the player only over its private socket. Read back, the file is checked as if TikTok had just sent it.
