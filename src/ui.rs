@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 
 use crate::app::{App, FeedState};
 use crate::cache::Download;
@@ -188,7 +188,9 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(c.border))
-        .title(Line::from(" tuitok ").fg(c.accent).bold());
+        .title(Line::from(" ♪ tuitok ").fg(c.accent).bold())
+        .padding(Padding::new(2, 2, 1, 1));
+    let width = block.inner(area).width;
     let mut lines: Vec<Line> = Vec::new();
     match app.current() {
         Some(v) => {
@@ -228,12 +230,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
                     let paused = if paused { " · paused" } else { "" };
                     let when = format!("{} / {}{paused} · {at}", clock(position), clock(length));
                     lines.push(Line::from(when).fg(c.dim));
-                    lines.push(progress(
-                        app,
-                        position,
-                        length,
-                        area.width.saturating_sub(2),
-                    ));
+                    lines.push(progress(app, position, length, width));
                 }
                 None => lines.push(Line::from(format!("{} · {at}", clock(v.seconds))).fg(c.dim)),
             }
@@ -318,7 +315,16 @@ fn status(app: &App) -> Line<'static> {
                 .fg(c.red)
         }
         FeedState::Fetching(engine) => {
-            Line::from(format!("Fetching the feed with {}…", engine.name())).fg(c.dim)
+            let videos = match app.batch_size {
+                1 => "1 video".to_owned(),
+                n => format!("{n} videos"),
+            };
+            let mut said = format!("Fetching {videos} with {}…", engine.name());
+            let so_far = app.found_so_far();
+            if so_far > 0 {
+                said.push_str(&format!(" {so_far} so far"));
+            }
+            Line::from(said).fg(c.dim)
         }
         FeedState::Fetched {
             new,
@@ -428,7 +434,7 @@ pub mod tests {
         app.feed = FeedState::NoBrowser;
         let text = screen(&app, 120, 40);
         assert!(text.contains("No videos yet"));
-        assert!(text.contains(" tuitok "));
+        assert!(text.contains("╭ ♪ tuitok ─"));
         assert!(text.contains("Not in Pepper"));
         let last = text.lines().last().unwrap();
         assert!(last.starts_with(" j k next/back  space pause  m mute  f fill  r more  q quit"));
@@ -574,7 +580,7 @@ pub mod tests {
         app.pepper = true;
         let text = screen(&app, 60, 30);
         assert!(text.contains("No videos yet"));
-        assert!(!text.contains(" tuitok "));
+        assert!(!text.contains("♪ tuitok"));
     }
 
     #[test]

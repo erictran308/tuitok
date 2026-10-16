@@ -38,9 +38,10 @@ const GUESSED_CELL: (u16, u16) = (9, 18);
 /// The terminal's size in cells when it doesn't say.
 const GUESSED_SIZE: (u16, u16) = (120, 40);
 
-/// More of the feed is fetched once this few videos are left after the one
-/// shown.
-const REFILL_AT: usize = 5;
+/// Once the first batches (`feed::SIZES`, one after another) are in, the
+/// next batch is fetched when the video shown is the 8th of the last one: 5
+/// left after it.
+const REFILL_AT: usize = feed::BATCH - 8;
 
 /// After a batch fails, how long before one is tried again on its own (`r`
 /// tries at once).
@@ -53,6 +54,9 @@ const NO_PLAYER: &str = "No player: brew install mpv";
 
 /// What tuitok's own tasks tell the event loop.
 pub enum AppEvent {
+    /// Videos of the batch being fetched, as the page gets them.
+    Found(Vec<Video>),
+    /// The batch ended.
     Batch(Result<Batch, String>),
     /// How far a download has got.
     Progress {
@@ -61,10 +65,7 @@ pub enum AppEvent {
         of: Option<u64>,
     },
     /// A download ended: ready, to stream, or failed.
-    Downloaded {
-        id: VideoId,
-        outcome: Download,
-    },
+    Downloaded { id: VideoId, outcome: Download },
     /// A video's cover arrived and was decoded, or didn't.
     CoverFetched {
         id: VideoId,
@@ -76,10 +77,7 @@ pub enum AppEvent {
         encoded: Result<Encoded, String>,
     },
     /// What player number `player` said: an older player's words are dropped.
-    Player {
-        player: u64,
-        event: PlayerEvent,
-    },
+    Player { player: u64, event: PlayerEvent },
 }
 
 /// Where the feed is at, for the status line.
@@ -133,6 +131,17 @@ pub struct App {
     cache: PathBuf,
     seen: HashSet<VideoId>,
     fetching: bool,
+    /// Where the batch being fetched starts in `videos`, and how many it
+    /// asks for.
+    batch_from: usize,
+    pub batch_size: usize,
+    /// Batches fetched so far: the next one's size is `feed::batch_size`.
+    batches: usize,
+    /// Videos past what the last batch asked for: the next batch's first.
+    spare: Vec<Video>,
+    /// The guest's cookies from the last batch, for the next one: only in
+    /// memory (`feed::Ask::cookies`).
+    cookies: Vec<serde_json::Value>,
     failed_at: Option<Instant>,
     /// Downloads running.
     running: usize,
@@ -200,6 +209,11 @@ impl App {
             cache: session.cache.clone(),
             seen: HashSet::new(),
             fetching: false,
+            batch_from: 0,
+            batch_size: feed::batch_size(0),
+            batches: 0,
+            spare: Vec::new(),
+            cookies: Vec::new(),
             failed_at: None,
             running: 0,
             player_with,
@@ -323,9 +337,17 @@ impl App {
             token: None,
             engine: Engine::Lightpanda,
             took: Duration::from_secs(14),
+            first: Some(Duration::from_millis(1500)),
+            spare: Vec::new(),
+            cookies: Vec::new(),
             note: None,
         }));
         app
+    }
+
+    /// How many videos the batch being fetched has added so far.
+    pub fn found_so_far(&self) -> usize {
+        self.videos.len() - self.batch_from
     }
 
     /// Whether the player shows the video shown.
@@ -346,27 +368,75 @@ impl App {
             && !self.shows_picture()
     }
 
-    /// Starts fetching a batch, unless one is being fetched.
+    /// Starts fetching the next batch, unless one is being fetched.
     fn fetch_more(&mut self) {
         if self.fetching {
             return;
         }
-        let (Some(tx), Some(&(engine, _))) = (&self.tx, self.engines.first()) else {
+        let (Some(tx), Some(&(engine, _))) = (self.tx.clone(), self.engines.first()) else {
+            return;
+        };
+        let Some(ask) = self.next_ask() else {
             return;
         };
         self.fetching = true;
         self.feed = FeedState::Fetching(engine);
-        let (tx, engines, profile) = (tx.clone(), self.engines.clone(), self.profile.clone());
+        let (engines, profile) = (self.engines.clone(), self.profile.clone());
         tokio::spawn(async move {
-            let batch = feed::fetch_any(engines, profile, feed::WANT)
+            let tell = |videos| {
+                let _ = tx.send(AppEvent::Found(videos));
+            };
+            let batch = feed::fetch_any(engines, profile, ask, &tell)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::Batch(batch));
         });
     }
 
+    /// What the next batch asks the browser for. The spare videos come
+    /// first: a batch they fill needs no browser, and the next one starts
+    /// while the first batches are coming in. `None` once nothing's to fetch.
+    fn next_ask(&mut self) -> Option<feed::Ask> {
+        loop {
+            self.batch_size = feed::batch_size(self.batches);
+            self.batch_from = self.videos.len();
+            let take = self.spare.len().min(self.batch_size);
+            let spare: Vec<Video> = self.spare.drain(..take).collect();
+            if !spare.is_empty() {
+                self.add(spare);
+                self.prefetch();
+                self.want_covers();
+                self.play_current();
+            }
+            if self.found_so_far() < self.batch_size {
+                return Some(feed::Ask {
+                    want: self.batch_size - self.found_so_far(),
+                    seen: self.seen.clone(),
+                    cookies: self.cookies.clone(),
+                });
+            }
+            self.batches += 1;
+            self.batch_from = self.videos.len();
+            if !self.ramping() {
+                return None;
+            }
+        }
+    }
+
+    /// Whether the next batch is one of the first, fetched as soon as the
+    /// one before ends.
+    fn ramping(&self) -> bool {
+        self.batches < feed::SIZES.len()
+    }
+
     fn on_app_event(&mut self, event: AppEvent) {
         match event {
+            AppEvent::Found(videos) => {
+                self.add(videos);
+                self.prefetch();
+                self.want_covers();
+                self.play_current();
+            }
             AppEvent::Batch(batch) => {
                 self.on_batch(batch);
                 self.prefetch();
@@ -428,19 +498,30 @@ impl App {
         }
     }
 
-    /// Adds a batch's videos not seen before, after the ones there.
+    /// Adds the videos not seen before, after the ones there.
+    fn add(&mut self, videos: Vec<Video>) {
+        for video in videos {
+            if self.seen.insert(video.id.clone()) {
+                self.videos.push(video);
+            }
+        }
+    }
+
+    /// A batch ended: its videos came before (`AppEvent::Found`), any not
+    /// added yet are. While the first batches are in, the next starts.
     fn on_batch(&mut self, batch: Result<Batch, String>) {
         self.fetching = false;
+        let ok = batch.is_ok();
         match batch {
             Ok(batch) => {
-                let before = self.videos.len();
-                for video in batch.videos {
-                    if self.seen.insert(video.id.clone()) {
-                        self.videos.push(video);
-                    }
+                self.add(batch.videos);
+                self.spare.extend(batch.spare);
+                if !batch.cookies.is_empty() {
+                    self.cookies = batch.cookies;
                 }
+                self.batches += 1;
                 self.feed = FeedState::Fetched {
-                    new: self.videos.len() - before,
+                    new: self.found_so_far(),
                     engine: batch.engine,
                     took: batch.took,
                     note: batch.note,
@@ -451,6 +532,10 @@ impl App {
                 self.feed = FeedState::Failed(text::one_line(&e, 300));
                 self.failed_at = Some(Instant::now());
             }
+        }
+        self.batch_from = self.videos.len();
+        if ok && self.ramping() {
+            self.fetch_more();
         }
     }
 
@@ -865,6 +950,9 @@ pub mod tests {
             token: None,
             engine: Engine::Lightpanda,
             took: Duration::from_secs(17),
+            first: None,
+            spare: Vec::new(),
+            cookies: Vec::new(),
             note: None,
         }));
         app
@@ -891,6 +979,9 @@ pub mod tests {
             token: None,
             engine: Engine::Chrome,
             took: Duration::from_secs(20),
+            first: None,
+            spare: Vec::new(),
+            cookies: Vec::new(),
             note: Some("Lightpanda got no videos".into()),
         }));
         assert_eq!(app.videos.len(), 3);
@@ -909,6 +1000,86 @@ pub mod tests {
         assert_eq!(app.at, 0);
         app.on_batch(Err("Lightpanda: no\u{1b}[2J".into()));
         assert_eq!(app.feed, FeedState::Failed("Lightpanda: no[2J".into()));
+    }
+
+    fn batch(videos: &[&str], spare: &[&str]) -> Batch {
+        Batch {
+            videos: videos
+                .iter()
+                .map(|id| crate::ui::tests::video(id))
+                .collect(),
+            spare: spare.iter().map(|id| crate::ui::tests::video(id)).collect(),
+            cookies: vec![serde_json::json!({"name": "ttwid", "value": "a"})],
+            token: None,
+            engine: Engine::Lightpanda,
+            took: Duration::from_secs(2),
+            first: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn batches_grow_and_the_spare_comes_first() {
+        let mut app = app_with(Vec::new());
+        app.batches = 0;
+        assert_eq!(app.next_ask().unwrap().want, 1);
+        // The page's answer had 2: one is spare, the first of the next batch.
+        app.on_batch(Ok(batch(&["1"], &["2"])));
+        let ask = app.next_ask().unwrap();
+        assert_eq!((app.batch_size, ask.want, app.found_so_far()), (2, 1, 1));
+        assert!(ask.seen.contains(&VideoId::new("2").unwrap()));
+        assert_eq!(ask.cookies.len(), 1, "the guest goes on");
+        // A spare that fills the batches of 3 and 5 needs no browser for them.
+        app.on_batch(Ok(batch(
+            &["3"],
+            &["4", "5", "6", "7", "8", "9", "10", "11"],
+        )));
+        assert_eq!(app.videos.len(), 3);
+        let ask = app.next_ask().unwrap();
+        assert_eq!((app.batches, app.batch_size, ask.want), (4, 8, 8));
+        assert_eq!(app.videos.len(), 11);
+    }
+
+    #[test]
+    fn after_the_first_batches_a_full_spare_waits_for_the_8th_video() {
+        let mut app = app_with(Vec::new());
+        app.batches = feed::SIZES.len();
+        app.spare = (1..=15)
+            .map(|n| crate::ui::tests::video(&n.to_string()))
+            .collect();
+        assert!(app.next_ask().is_none());
+        assert_eq!((app.videos.len(), app.spare.len()), (13, 2));
+        let ask = app.next_ask().unwrap();
+        assert_eq!((app.found_so_far(), ask.want), (2, 11));
+        assert_eq!(REFILL_AT, 13 - 8);
+    }
+
+    #[test]
+    fn videos_count_as_they_come_and_the_batch_counts_them_once() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        app.fetching = true;
+        app.on_app_event(AppEvent::Found(vec![crate::ui::tests::video("2")]));
+        app.on_app_event(AppEvent::Found(vec![
+            crate::ui::tests::video("2"),
+            crate::ui::tests::video("3"),
+        ]));
+        assert_eq!(app.videos.len(), 3);
+        assert_eq!(app.found_so_far(), 2);
+        let all = ["1", "2", "3", "4"].map(crate::ui::tests::video).to_vec();
+        app.on_app_event(AppEvent::Batch(Ok(Batch {
+            videos: all,
+            token: None,
+            engine: Engine::Lightpanda,
+            took: Duration::from_secs(14),
+            first: Some(Duration::from_millis(1500)),
+            spare: Vec::new(),
+            cookies: Vec::new(),
+            note: None,
+        })));
+        assert_eq!(app.videos.len(), 4);
+        assert!(matches!(app.feed, FeedState::Fetched { new: 3, .. }));
+        assert_eq!(app.found_so_far(), 0);
+        assert!(!app.fetching);
     }
 
     #[test]

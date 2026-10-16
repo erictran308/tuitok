@@ -239,7 +239,11 @@ mod tests {
         let place = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/live-cache");
         crate::config::private_dir(&place).unwrap();
         let (engine, program) = crate::feed::engines(&tools, None).remove(0);
-        let batch = crate::feed::fetch(engine, &program, &place.join("chrome"), 10)
+        let ask = crate::feed::Ask {
+            want: 10,
+            ..Default::default()
+        };
+        let batch = crate::feed::fetch(engine, &program, &place.join("chrome"), &ask, &|_| {})
             .await
             .unwrap();
         let client = client(video_url_allowed);

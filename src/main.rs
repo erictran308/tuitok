@@ -202,7 +202,11 @@ fn list_feed(only: Option<Engine>) -> ExitCode {
     let result = runtime.block_on(feed::fetch_any(
         engines,
         session.profile.clone(),
-        feed::WANT,
+        feed::Ask {
+            want: feed::BATCH,
+            ..feed::Ask::default()
+        },
+        &|_| {},
     ));
     drop(runtime);
     session.end();
@@ -211,10 +215,13 @@ fn list_feed(only: Option<Engine>) -> ExitCode {
         Err(e) => return fail(&e),
     };
     println!(
-        "{}: {} videos in {:.1} s, tt_chain_token {}",
+        "{}: {} videos in {:.1} s (the first after {}), tt_chain_token {}",
         batch.engine.name(),
         batch.videos.len(),
         batch.took.as_secs_f64(),
+        batch
+            .first
+            .map_or_else(|| "-".to_owned(), |t| format!("{:.1} s", t.as_secs_f64())),
         if batch.token.is_some() { "yes" } else { "no" }
     );
     if let Some(note) = &batch.note {
