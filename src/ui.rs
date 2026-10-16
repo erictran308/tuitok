@@ -1,8 +1,8 @@
-//! Drawing: the video's box, upright (9:16) and as tall as the window, and
-//! beside it a panel with the video's author, caption, sound and counts,
-//! then the keys and the feed's state on the bottom line. Until playing
-//! lands, the box says what would play (the length and the rendition) and
-//! how its download is going.
+//! Drawing: the video's box, upright (9:16) and as tall as the window (the
+//! whole tab with `f`), and beside it a panel with the video's author,
+//! caption, sound, counts and where it's at, then the keys and the feed's
+//! state on the bottom line. Until a video plays in Pepper's box, the box
+//! shows its cover, with under it what plays and how it's going.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -12,12 +12,22 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::app::{App, FeedState};
 use crate::cache::Download;
+use crate::covers::Cover;
 use crate::pepper;
+use crate::video::{Video, VideoId};
 
 /// The panel beside the video, in columns, shown in windows at least
 /// `PANEL_FROM` columns wide.
 const PANEL: u16 = 36;
 const PANEL_FROM: u16 = 80;
+
+/// Why videos play in mpv's window in Pepper: multiplexer `name` is between.
+fn behind(name: &str) -> String {
+    format!("Inside {name}, videos play in mpv's window: Pepper's box needs tuitok outside {name}.")
+}
+
+/// Rows of text under the cover in the box.
+const TEXT_ROWS: u16 = 3;
 
 /// Where things go in a window: the video's box, the panel beside it (in
 /// wide windows), the bottom line. `App::box_pixels` lays it out the same.
@@ -27,8 +37,17 @@ pub struct Areas {
     pub bottom: Rect,
 }
 
-pub fn areas(area: Rect, cell: (u16, u16)) -> Areas {
+/// Lays out a window of `area`: with `fullscreen` (`f`, in Pepper) the
+/// video takes all but the bottom line, and there's no panel.
+pub fn areas(area: Rect, cell: (u16, u16), fullscreen: bool) -> Areas {
     let [main, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    if fullscreen {
+        return Areas {
+            video: main,
+            panel: None,
+            bottom,
+        };
+    }
     let (video_side, panel) = if main.width >= PANEL_FROM {
         let [video, panel] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(PANEL)]).areas(main);
@@ -43,11 +62,21 @@ pub fn areas(area: Rect, cell: (u16, u16)) -> Areas {
     }
 }
 
+/// Where the cover goes in the video's box: all of it but `TEXT_ROWS` at
+/// the bottom (all of it in the demo); nothing in a box too small for both.
+pub fn cover_area(video: Rect, demo: bool) -> Rect {
+    let text = if demo { 0 } else { TEXT_ROWS };
+    if video.height < text + 4 {
+        return Rect::default();
+    }
+    Rect::new(video.x, video.y, video.width, video.height - text)
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let c = &app.colors;
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
-    let areas = areas(area, app.cell);
+    let areas = areas(area, app.cell, app.fullscreen);
     frame.render_widget(Block::new().style(Style::new().bg(c.panel)), areas.video);
     draw_in_box(frame, app, areas.video);
     if let Some(panel) = areas.panel {
@@ -61,8 +90,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     // Pepper shows the picture over the box: black under it, nothing else.
+    // True black: `Color::Black` is the palette's colour 0, which themes
+    // paint grey (#45475a in Catppuccin).
     if app.picture_in_box() {
-        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
+        frame.render_widget(
+            Block::new().style(Style::new().bg(Color::Rgb(0, 0, 0))),
+            area,
+        );
         return;
     }
     let lines = match app.current() {
@@ -85,6 +119,8 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
                 Line::from("Loading…").fg(c.dim)
             } else if app.shows_picture() {
                 Line::from("Playing in mpv's window").fg(c.ok)
+            } else if app.demo {
+                Line::from("Made up: nothing plays").fg(c.dim)
             } else {
                 download_line(app, &video.id)
             });
@@ -98,18 +134,40 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
             vec![Line::from(why).fg(c.dim)]
         }
     };
-    let height = (lines.len() as u16).min(area.height);
-    let middle = Rect::new(
-        area.x,
-        area.y + (area.height - height) / 2,
-        area.width,
-        height,
-    );
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+    let cover = app.current().and_then(|v| match app.covers.get(&v.id) {
+        Some(Cover::Ready {
+            encoded: Some(encoded),
+            ..
+        }) => Some(encoded),
+        _ => None,
+    });
+    let picture = cover_area(area, app.demo);
+    match cover {
+        Some(encoded) if encoded.size == (picture.width, picture.height) && picture.height > 0 => {
+            frame.render_widget(ratatui_image::Image::new(&encoded.protocol), picture);
+            let below = Rect::new(
+                area.x,
+                picture.bottom(),
+                area.width,
+                area.bottom() - picture.bottom(),
+            );
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), below);
+        }
+        _ => {
+            let height = (lines.len() as u16).min(area.height);
+            let middle = Rect::new(
+                area.x,
+                area.y + (area.height - height) / 2,
+                area.width,
+                height,
+            );
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+        }
+    }
 }
 
 /// How the download of video `id` is going.
-fn download_line(app: &App, id: &crate::video::VideoId) -> Line<'static> {
+fn download_line(app: &App, id: &VideoId) -> Line<'static> {
     let c = &app.colors;
     match app.downloads.get(id) {
         Some(Download::Getting { got, of: Some(of) }) if *of > 0 => {
@@ -165,17 +223,30 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(counts).fg(c.dim));
             }
             let at = format!("{} of {}", app.at + 1, app.videos.len());
-            let when = if app.shows_picture() {
-                let length = app.duration.map_or(v.seconds, |d| d.round() as u32);
-                let paused = if app.paused { " · paused" } else { "" };
-                format!("{} / {}{paused}", clock(app.position as u32), clock(length))
-            } else {
-                clock(v.seconds)
-            };
-            lines.push(Line::from(format!("{when} · {at}")).fg(c.dim));
+            match position(app, v) {
+                Some((position, length, paused)) => {
+                    let paused = if paused { " · paused" } else { "" };
+                    let when = format!("{} / {}{paused} · {at}", clock(position), clock(length));
+                    lines.push(Line::from(when).fg(c.dim));
+                    lines.push(progress(
+                        app,
+                        position,
+                        length,
+                        area.width.saturating_sub(2),
+                    ));
+                }
+                None => lines.push(Line::from(format!("{} · {at}", clock(v.seconds))).fg(c.dim)),
+            }
+            if let Some(name) = app.behind_multiplexer {
+                lines.push(Line::default());
+                lines.push(Line::from(behind(name)).fg(c.subtext));
+            }
         }
         None if app.pepper => lines.push(Line::from("In Pepper: videos play in the box").fg(c.ok)),
-        None => lines.push(Line::from("Not in Pepper: videos will play in mpv's window").fg(c.red)),
+        None => lines.push(match app.behind_multiplexer {
+            Some(name) => Line::from(behind(name)).fg(c.subtext),
+            None => Line::from("Not in Pepper: videos will play in mpv's window").fg(c.red),
+        }),
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -183,6 +254,31 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             .block(block),
         area,
     );
+}
+
+/// Where the video shown is, how long it is, and whether it's paused,
+/// while it plays (made up in the demo).
+fn position(app: &App, video: &Video) -> Option<(u32, u32, bool)> {
+    if app.demo {
+        return Some((video.seconds * 2 / 5, video.seconds, false));
+    }
+    let length = app.duration.map_or(video.seconds, |d| d.round() as u32);
+    app.shows_picture()
+        .then_some((app.position as u32, length, app.paused))
+}
+
+/// A bar `width` cells wide, as far along as `position` is in `length`.
+fn progress(app: &App, position: u32, length: u32, width: u16) -> Line<'static> {
+    let c = &app.colors;
+    let done = if length == 0 {
+        0
+    } else {
+        (u64::from(width) * u64::from(position.min(length)) / u64::from(length)) as usize
+    };
+    Line::from(vec![
+        Span::from("━".repeat(done)).fg(c.accent),
+        Span::from("━".repeat(usize::from(width) - done)).fg(c.border),
+    ])
 }
 
 /// The keys on the left, the feed's state on the right.
@@ -203,6 +299,7 @@ fn hints(app: &App) -> Line<'static> {
         ("j k", "next/back"),
         ("space", "pause"),
         ("m", "mute"),
+        ("f", "fill"),
         ("r", "more"),
         ("q", "quit"),
     ] {
@@ -334,7 +431,7 @@ pub mod tests {
         assert!(text.contains(" tuitok "));
         assert!(text.contains("Not in Pepper"));
         let last = text.lines().last().unwrap();
-        assert!(last.starts_with(" j k next/back  space pause  m mute  r more  q quit"));
+        assert!(last.starts_with(" j k next/back  space pause  m mute  f fill  r more  q quit"));
         assert!(last.contains("No browser for the feed"));
     }
 
@@ -406,6 +503,69 @@ pub mod tests {
         app.playing = None;
         app.play_error = Some("It can't play: loading failed".into());
         assert!(screen(&app, 120, 40).contains("It can't play: loading failed"));
+    }
+
+    #[test]
+    fn a_cover_shows_in_the_box_with_the_text_under_it() {
+        use crate::covers::{Cover, encode_now};
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        let video_box = areas(Rect::new(0, 0, 120, 40), app.cell, false).video;
+        let picture = cover_area(video_box, false);
+        let encoded = encode_now(
+            &ratatui_image::picker::Picker::halfblocks(),
+            &crate::demo::cover(0),
+            (picture.width, picture.height),
+        )
+        .unwrap();
+        let cover = Cover::Ready {
+            picture: std::sync::Arc::new(crate::demo::cover(0)),
+            encoded: Some(encoded),
+            encoding: false,
+        };
+        app.covers.insert(VideoId::new("1").unwrap(), cover);
+        let text = screen(&app, 120, 40);
+        let rows: Vec<&str> = text.lines().collect();
+        // Half blocks in the box, the text in its bottom rows.
+        let middle = rows[usize::from(video_box.y + video_box.height / 2)];
+        assert!(middle.contains('▀') || middle.contains('▄'), "{middle}");
+        let under = rows[usize::from(picture.bottom())..usize::from(video_box.bottom())].join("\n");
+        assert!(
+            under.contains("1:15") && under.contains("Waiting to download"),
+            "{under}"
+        );
+    }
+
+    #[test]
+    fn the_demo_and_filling_the_tab() {
+        let mut app = crate::app::App::demo(true);
+        app.cell = (9, 18);
+        app.size = (120, 40);
+        let text = screen(&app, 120, 40);
+        assert!(text.contains("@made.up.cat") && text.contains("1 of 6"));
+        assert!(text.contains("0:05 / 0:14 · 1 of 6") && text.contains("━"));
+        assert!(!text.contains("Waiting to download"));
+        // f: the box takes all but the bottom line, and the panel goes.
+        let filled = areas(Rect::new(0, 0, 120, 40), app.cell, true);
+        assert_eq!(
+            (filled.video, filled.panel),
+            (Rect::new(0, 0, 120, 39), None)
+        );
+        app.fullscreen = true;
+        assert!(!screen(&app, 120, 40).contains("@made.up.cat"));
+    }
+
+    #[test]
+    fn inside_a_multiplexer_in_pepper_the_panel_says_why_videos_play_in_a_window() {
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        app.behind_multiplexer = Some("herdr");
+        let text = screen(&app, 120, 40);
+        // Wrapped at the panel's width.
+        assert!(
+            text.contains("Inside herdr,") && text.contains("outside herdr."),
+            "{text}"
+        );
+        app.videos.clear();
+        assert!(screen(&app, 120, 40).contains("Inside herdr,"));
     }
 
     #[test]

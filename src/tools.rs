@@ -84,7 +84,7 @@ fn from_var(name: &str) -> Option<PathBuf> {
         .filter(|p| p.is_absolute() && runnable(p))
 }
 
-fn on_path(name: &str) -> Option<PathBuf> {
+pub fn on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .filter(|folder| folder.is_absolute())

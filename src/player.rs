@@ -213,6 +213,10 @@ impl Player {
         self.command(json!(["cycle", "mute"]));
     }
 
+    pub fn toggle_fullscreen(&self) {
+        self.command(json!(["cycle", "fullscreen"]));
+    }
+
     pub fn seek(&self, seconds: f64) {
         self.command(json!(["seek", seconds, "relative"]));
     }
@@ -346,8 +350,8 @@ mod tests {
             rendition,
             token: video.token.clone(),
         };
-        let cache::Download::Ready(path) = cache::download(&cache::client(), &job, |_, _| {}).await
-        else {
+        let client = cache::client(crate::video::video_url_allowed);
+        let cache::Download::Ready(path) = cache::download(&client, &job, |_, _| {}).await else {
             panic!("no download");
         };
         player.load(&Target::File(path));

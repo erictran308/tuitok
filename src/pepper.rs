@@ -15,10 +15,16 @@ use ratatui::layout::Rect;
 /// The token's random bytes (32 hex digits).
 const TOKEN_BYTES: usize = 16;
 
-/// What a terminal multiplexer running tuitok sets: tmux, GNU screen,
-/// zellij. Each would need every escape sequence wrapped to pass it on, and
-/// screen may log them (`screen -L`).
-const MULTIPLEXERS: [&str; 3] = ["TMUX", "STY", "ZELLIJ"];
+/// What a terminal multiplexer running tuitok sets, and its name: tmux, GNU
+/// screen, zellij, herdr. Each would need every escape sequence wrapped (and
+/// its cells moved to where its pane is) to pass it on, and screen may log
+/// them (`screen -L`).
+const MULTIPLEXERS: [(&str, &str); 4] = [
+    ("TMUX", "tmux"),
+    ("STY", "screen"),
+    ("ZELLIJ", "zellij"),
+    ("HERDR_PANE_ID", "herdr"),
+];
 
 /// Pepper's port, from `PEPPER_PORT`, when tuitok runs in Pepper: not
 /// through a multiplexer.
@@ -27,10 +33,26 @@ pub fn port() -> Option<OsString> {
 }
 
 fn port_from(var: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
-    if MULTIPLEXERS.iter().any(|name| var(name).is_some()) {
+    if multiplexer(&var).is_some() {
         return None;
     }
     var("PEPPER_PORT").filter(|port| !port.is_empty())
+}
+
+/// The terminal multiplexer running tuitok, by name, if one does.
+pub fn multiplexer(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
+    MULTIPLEXERS
+        .iter()
+        .find(|(variable, _)| var(variable).is_some())
+        .map(|&(_, name)| name)
+}
+
+/// tuitok runs in Pepper, but through a multiplexer, by name: Pepper is
+/// there, and its box can't be placed, so videos play in mpv's window.
+pub fn behind_multiplexer() -> Option<&'static str> {
+    let var = |name: &str| std::env::var_os(name);
+    var("PEPPER_PORT").filter(|port| !port.is_empty())?;
+    multiplexer(var)
 }
 
 /// A token for one player's picture: random hex digits, as Pepper takes
@@ -107,20 +129,31 @@ mod tests {
         );
         assert_eq!(port_from(env(&[])), None);
         assert_eq!(port_from(env(&[("PEPPER_PORT", "")])), None);
-        for multiplexer in MULTIPLEXERS {
-            assert_eq!(
-                port_from(env(match multiplexer {
-                    "TMUX" => &[
-                        ("PEPPER_PORT", "x.1"),
-                        ("TMUX", "/tmp/tmux-501/default,1,0")
-                    ],
-                    "STY" => &[("PEPPER_PORT", "x.1"), ("STY", "123.ttys001.mac")],
-                    _ => &[("PEPPER_PORT", "x.1"), ("ZELLIJ", "0")],
-                })),
-                None,
-                "{multiplexer}"
-            );
+        for (variable, name) in MULTIPLEXERS {
+            let var = |asked: &str| {
+                (asked == variable || asked == "PEPPER_PORT").then(|| OsString::from("x"))
+            };
+            assert_eq!(port_from(var), None, "{name}");
+            assert_eq!(multiplexer(var), Some(name));
         }
+    }
+
+    #[test]
+    fn multiplexers_by_their_variables() {
+        let env = |vars: &'static [(&str, &str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        assert_eq!(
+            multiplexer(env(&[("TMUX", "/tmp/tmux-501/default,1,0")])),
+            Some("tmux")
+        );
+        let herdr = env(&[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w12:p2")]);
+        assert_eq!(multiplexer(herdr), Some("herdr"));
+        assert_eq!(multiplexer(env(&[("TERM_PROGRAM", "ghostty")])), None);
     }
 
     #[test]

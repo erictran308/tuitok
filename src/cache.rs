@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncWriteExt;
 
 use crate::text;
-use crate::video::{Codec, Rendition, VideoId, video_url_allowed};
+use crate::video::{Codec, Rendition, VideoId};
 
 /// Videos downloaded after the one shown, and kept before it.
 pub const AHEAD: usize = 3;
@@ -58,11 +58,12 @@ pub struct Job {
     pub path: PathBuf,
 }
 
-/// The client for TikTok's video hosts: rustls with ring, https only, no
-/// cookies kept but the one each download sends, no proxy from the
-/// environment (the browser gets none either), and redirects only to
-/// TikTok's video hosts, at most 2.
-pub fn client() -> reqwest::Client {
+/// A client for TikTok's hosts: rustls with ring, https only, no cookies
+/// kept but the one a download sends, no proxy from the environment (the
+/// browser gets none either), and redirects only where `allowed` says
+/// (`video_url_allowed` for videos, `image_url_allowed` for covers), at
+/// most 2.
+pub fn client(allowed: fn(&str) -> bool) -> reqwest::Client {
     // ring does the cryptography; the first client sets it for the process.
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
@@ -72,8 +73,8 @@ pub fn client() -> reqwest::Client {
         .https_only(true)
         .referer(false)
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() < 3 && video_url_allowed(attempt.url().as_str()) {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() < 3 && allowed(attempt.url().as_str()) {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -209,6 +210,7 @@ fn is_mp4(head: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::video_url_allowed;
 
     #[test]
     fn names_and_mp4s() {
@@ -240,7 +242,7 @@ mod tests {
         let batch = crate::feed::fetch(engine, &program, &place.join("chrome"), 10)
             .await
             .unwrap();
-        let client = client();
+        let client = client(video_url_allowed);
         for video in batch.videos.iter().take(2) {
             let rendition = video.best((608, 1080)).unwrap().clone();
             let job = Job {

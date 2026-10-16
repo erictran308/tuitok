@@ -6,17 +6,23 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
+use image::DynamicImage;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use ratatui_image::picker::Picker;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::browser::Engine;
 use crate::cache::{self, Download};
 use crate::config::Session;
+use crate::covers::{self, Cover, Encoded};
+use crate::demo;
 use crate::feed::{self, Batch};
 use crate::pepper::{self, Placed};
 use crate::player::{Kind, Player, PlayerEvent, Target};
@@ -58,6 +64,16 @@ pub enum AppEvent {
     Downloaded {
         id: VideoId,
         outcome: Download,
+    },
+    /// A video's cover arrived and was decoded, or didn't.
+    CoverFetched {
+        id: VideoId,
+        picture: Result<DynamicImage, String>,
+    },
+    /// A cover was encoded for the terminal, or wasn't.
+    CoverEncoded {
+        id: VideoId,
+        encoded: Result<Encoded, String>,
     },
     /// What player number `player` said: an older player's words are dropped.
     Player {
@@ -132,6 +148,18 @@ pub struct App {
     /// Pepper was last told.
     token: Option<String>,
     placed: Option<Placed>,
+    /// Covers by video, how the terminal draws pictures (none in tests),
+    /// and the client for TikTok's image hosts.
+    pub covers: HashMap<VideoId, Cover>,
+    picker: Option<Picker>,
+    cover_client: Option<reqwest::Client>,
+    /// `f` in Pepper: the video fills the tab.
+    pub fullscreen: bool,
+    /// `--demo`: made-up videos, nothing fetched, downloaded or played.
+    pub demo: bool,
+    /// tuitok runs in Pepper but through a multiplexer, by name
+    /// (`pepper::behind_multiplexer`): videos play in mpv's window.
+    pub behind_multiplexer: Option<&'static str>,
     /// The client for the videos, and where tasks send `AppEvent`s, once
     /// `run` has started.
     client: Option<reqwest::Client>,
@@ -180,6 +208,12 @@ impl App {
             loaded: None,
             token: None,
             placed: None,
+            covers: HashMap::new(),
+            picker: None,
+            cover_client: None,
+            fullscreen: false,
+            demo: false,
+            behind_multiplexer: None,
             client: None,
             tx: None,
             quit: false,
@@ -189,9 +223,18 @@ impl App {
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let (tx, mut app_events) = mpsc::unbounded_channel();
         self.tx = Some(tx);
-        self.client = Some(cache::client());
+        if !self.demo {
+            self.client = Some(cache::client(crate::video::video_url_allowed));
+            self.cover_client = Some(cache::client(crate::video::image_url_allowed));
+        }
+        self.want_covers();
         self.fetch_more();
         let mut terminal_events = EventStream::new();
+        // The terminal window closed (SIGHUP), or tuitok was asked to end
+        // (SIGTERM): it quits as with q, so the player quits, Pepper's box
+        // goes and the session's folder is deleted.
+        let mut hangup = signal(SignalKind::hangup())?;
+        let mut terminate = signal(SignalKind::terminate())?;
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, self))?;
             let placement = self.placement();
@@ -203,6 +246,8 @@ impl App {
                     None => break,
                 },
                 Some(event) = app_events.recv() => self.on_app_event(event),
+                _ = hangup.recv() => self.quit = true,
+                _ = terminate.recv() => self.quit = true,
             }
         }
         if let Some(placed) = self.placed.take() {
@@ -221,7 +266,12 @@ impl App {
 
     /// The video box, laid out as `ui::draw` lays it out.
     fn video_area(&self) -> Rect {
-        ui::areas(Rect::new(0, 0, self.size.0, self.size.1), self.cell).video
+        ui::areas(
+            Rect::new(0, 0, self.size.0, self.size.1),
+            self.cell,
+            self.fullscreen,
+        )
+        .video
     }
 
     /// The video box's size in pixels.
@@ -231,6 +281,51 @@ impl App {
             u32::from(video.width) * u32::from(self.cell.0),
             u32::from(video.height) * u32::from(self.cell.1),
         )
+    }
+
+    /// The cover's size in cells, as `ui` draws it in the box.
+    fn cover_size(&self) -> (u16, u16) {
+        let area = ui::cover_area(self.video_area(), self.demo);
+        (area.width, area.height)
+    }
+
+    /// Sets how pictures are drawn, and takes the cell size it found if the
+    /// terminal didn't say (a picker that didn't ask guesses 10×20).
+    pub fn set_picker(&mut self, picker: Picker) {
+        let font = picker.font_size();
+        if self.cell == GUESSED_CELL && font.width > 0 && font.height > 0 {
+            self.cell = (font.width, font.height);
+        }
+        self.picker = Some(picker);
+    }
+
+    /// `--demo`: made-up videos and covers drawn in code; nothing is
+    /// fetched, downloaded or played.
+    pub fn demo(pepper: bool) -> Self {
+        let nowhere = Session {
+            dir: PathBuf::new(),
+            profile: PathBuf::new(),
+            cache: PathBuf::new(),
+        };
+        let mut app = Self::new(pepper, Vec::new(), &nowhere, None);
+        app.demo = true;
+        let videos = demo::videos();
+        for (n, video) in videos.iter().enumerate() {
+            let cover = Cover::Ready {
+                picture: Arc::new(demo::cover(n)),
+                encoded: None,
+                encoding: false,
+            };
+            app.covers.insert(video.id.clone(), cover);
+        }
+        app.on_batch(Ok(Batch {
+            videos,
+            token: None,
+            engine: Engine::Lightpanda,
+            took: Duration::from_secs(14),
+            note: None,
+        }));
+        app
     }
 
     /// Whether the player shows the video shown.
@@ -275,6 +370,7 @@ impl App {
             AppEvent::Batch(batch) => {
                 self.on_batch(batch);
                 self.prefetch();
+                self.want_covers();
                 self.play_current();
             }
             AppEvent::Progress { id, got, of } => {
@@ -292,6 +388,40 @@ impl App {
                 self.downloads.insert(id, outcome);
                 self.prefetch();
                 self.play_current();
+            }
+            AppEvent::CoverFetched { id, picture } => {
+                let cover = match picture {
+                    Ok(picture) => Cover::Ready {
+                        picture: Arc::new(picture),
+                        encoded: None,
+                        encoding: false,
+                    },
+                    Err(_) => Cover::Failed,
+                };
+                self.covers.insert(id, cover);
+                self.want_covers();
+            }
+            AppEvent::CoverEncoded { id, encoded } => {
+                let failed = match (self.covers.get_mut(&id), encoded) {
+                    (
+                        Some(Cover::Ready {
+                            encoded: slot,
+                            encoding,
+                            ..
+                        }),
+                        Ok(encoded),
+                    ) => {
+                        *encoding = false;
+                        *slot = Some(encoded);
+                        false
+                    }
+                    (Some(Cover::Ready { .. }), Err(_)) => true,
+                    _ => false,
+                };
+                if failed {
+                    self.covers.insert(id, Cover::Failed);
+                }
+                self.want_covers();
             }
             AppEvent::Player { player, event } if player == self.players => self.on_player(event),
             AppEvent::Player { .. } => {}
@@ -364,6 +494,9 @@ impl App {
     /// Plays the video shown if it can and isn't already; while it can't
     /// yet, the player stops, so the last one doesn't play on under it.
     fn play_current(&mut self) {
+        if self.demo {
+            return;
+        }
         let Some(id) = self.current().map(|v| v.id.clone()) else {
             return;
         };
@@ -549,6 +682,71 @@ impl App {
                 let _ = std::fs::remove_file(path);
             }
         }
+        // Covers too, but not the demo's, which can't be fetched again.
+        if self.demo {
+            return;
+        }
+        let keep_to = self.at + cache::AHEAD;
+        for (n, video) in self.videos.iter().enumerate() {
+            if (n < keep_from || n > keep_to)
+                && !matches!(self.covers.get(&video.id), Some(Cover::Loading))
+            {
+                self.covers.remove(&video.id);
+            }
+        }
+    }
+
+    /// Fetches the covers of the video shown and the `cache::AHEAD` after
+    /// it that aren't asked for yet, and encodes the fetched ones at the
+    /// cover's size (again when that changes).
+    fn want_covers(&mut self) {
+        let (Some(picker), Some(tx)) = (self.picker.clone(), self.tx.clone()) else {
+            return;
+        };
+        let size = self.cover_size();
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        let end = (self.at + cache::AHEAD + 1).min(self.videos.len());
+        for video in self.videos.get(self.at..end).unwrap_or_default() {
+            match self.covers.get_mut(&video.id) {
+                None => {
+                    let (Some(client), Some(url)) =
+                        (self.cover_client.clone(), video.cover.clone())
+                    else {
+                        continue;
+                    };
+                    self.covers.insert(video.id.clone(), Cover::Loading);
+                    let (tx, id) = (tx.clone(), video.id.clone());
+                    tokio::spawn(async move {
+                        let picture = covers::fetch(&client, &url)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(AppEvent::CoverFetched { id, picture });
+                    });
+                }
+                Some(Cover::Ready {
+                    picture,
+                    encoded,
+                    encoding,
+                }) if !*encoding && encoded.as_ref().is_none_or(|e| e.size != size) => {
+                    *encoding = true;
+                    let (tx, id, picker, picture) = (
+                        tx.clone(),
+                        video.id.clone(),
+                        picker.clone(),
+                        picture.clone(),
+                    );
+                    tokio::spawn(async move {
+                        let encoded = covers::encode(picker, picture, size)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(AppEvent::CoverEncoded { id, encoded });
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     fn on_event(&mut self, event: Event) {
@@ -557,6 +755,7 @@ impl App {
             Event::Resize(columns, rows) => {
                 self.cell = cell_size();
                 self.size = (columns, rows);
+                self.want_covers();
             }
             _ => {}
         }
@@ -572,6 +771,7 @@ impl App {
             KeyCode::Char('m') => self.with_player(Player::toggle_mute),
             KeyCode::Char('h') | KeyCode::Left => self.with_player(|p| p.seek(-SEEK)),
             KeyCode::Char('l') | KeyCode::Right => self.with_player(|p| p.seek(SEEK)),
+            KeyCode::Char('f') => self.toggle_fullscreen(),
             KeyCode::Char('r') => {
                 self.failed_at = None;
                 self.fetch_more();
@@ -589,6 +789,17 @@ impl App {
         }
     }
 
+    /// `f`: in Pepper the video fills the tab, or goes back to its box;
+    /// elsewhere mpv's window goes full screen.
+    fn toggle_fullscreen(&mut self) {
+        if self.pepper || self.demo {
+            self.fullscreen = !self.fullscreen;
+            self.want_covers();
+        } else {
+            self.with_player(Player::toggle_fullscreen);
+        }
+    }
+
     /// Shows the video `by` from this one, within the feed.
     fn go(&mut self, by: isize) {
         if self.videos.is_empty() {
@@ -597,6 +808,7 @@ impl App {
         self.at = self.at.saturating_add_signed(by).min(self.videos.len() - 1);
         self.prune();
         self.prefetch();
+        self.want_covers();
         self.play_current();
         self.refill();
     }

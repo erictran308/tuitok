@@ -7,11 +7,14 @@ mod browser;
 mod cache;
 mod cdp;
 mod config;
+mod covers;
+mod demo;
 mod feed;
 mod pepper;
 mod player;
 mod text;
 mod theme;
+mod tmux;
 mod tools;
 mod ui;
 mod video;
@@ -24,16 +27,17 @@ use browser::Engine;
 const HELP: &str = "\
 tuitok: TikTok's For You feed in the terminal, playing inside Pepper
 
-Usage: tuitok [--check | --feed [lightpanda | chrome] | --help | --version]
+Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --help | --version]
 
   --check     say what tuitok found: Pepper, its player, a browser for the feed
   --feed      fetch one batch of the feed and list it: with Lightpanda, else
               Chrome, or with the one named
+  --demo      the screen with made-up videos: nothing is fetched or played
   --help      print this
   --version   print tuitok's version
 
 Keys: j or ↓ the next video, k or ↑ the one before, space pause, m mute,
-h or ← and l or → back and on 5 s, r fetch more, q quit.
+h or ← and l or → back and on 5 s, f fill the tab, r fetch more, q quit.
 
 tuitok isn't made or endorsed by TikTok or ByteDance.";
 
@@ -64,6 +68,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["--feed"] => list_feed(None),
+        ["--demo"] => run_demo(),
         ["--feed", name] if Engine::parse(name).is_some() => list_feed(Engine::parse(name)),
         ["--help" | "-h"] => {
             println!("{HELP}");
@@ -112,8 +117,10 @@ fn run() -> ExitCode {
     let engines = feed::engines(&tools, None);
     let mut app = app::App::new(port.is_some(), engines, &session, player_with);
     let mut terminal = ratatui::init();
+    start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));
     ratatui::restore();
+    tmux::restore();
     // A batch still being fetched and the downloads end here, the browser
     // killed (`Browser`'s `Drop`), before the session's folder goes.
     drop(runtime);
@@ -124,6 +131,42 @@ fn run() -> ExitCode {
     }
 }
 
+/// `--demo`: the real screen with made-up videos; nothing is fetched,
+/// downloaded or played, and no folder is made.
+fn run_demo() -> ExitCode {
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => return fail(&e.into()),
+    };
+    let mut app = app::App::demo(pepper::port().is_some());
+    let mut terminal = ratatui::init();
+    start_screen(&mut app);
+    let result = runtime.block_on(app.run(&mut terminal));
+    ratatui::restore();
+    tmux::restore();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e.into()),
+    }
+}
+
+/// Once the terminal is set up and before keys are read: how it draws
+/// pictures (`covers::picker` asks it), and a panic hook that lets a
+/// picture decoder's caught panic pass without tearing the screen down
+/// (ratatui's hook, set by `ratatui::init`, restores the terminal).
+fn start_screen(app: &mut app::App) {
+    tmux::save();
+    app.set_picker(covers::picker());
+    app.behind_multiplexer = pepper::behind_multiplexer();
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !covers::panic_is_contained() {
+            tmux::restore();
+            restore(info);
+        }
+    }));
+}
+
 /// `--check`: what tuitok found, and where.
 fn check() {
     let tools = tools::Tools::find();
@@ -131,9 +174,13 @@ fn check() {
         path.as_deref()
             .map_or_else(|| "not found".to_owned(), tools::shown)
     };
-    match pepper::port() {
-        Some(_) => println!("Pepper:      yes, videos play in this tab"),
-        None => println!("Pepper:      no (not in Pepper, or inside tmux, screen or zellij)"),
+    match (pepper::port(), pepper::behind_multiplexer()) {
+        (Some(_), _) => println!("Pepper:      yes, videos play in this tab"),
+        (None, Some(name)) => println!(
+            "Pepper:      yes, but inside {name}, through which its box can't be placed: \
+             videos play in mpv's window"
+        ),
+        (None, None) => println!("Pepper:      no: videos play in mpv's window"),
     }
     println!("pepper-play: {}", found(&tools.pepper_play));
     println!("Lightpanda:  {}", found(&tools.lightpanda));

@@ -76,7 +76,9 @@ pub struct Video {
     pub likes: Option<u64>,
     pub comments: Option<u64>,
     pub shares: Option<u64>,
-    /// The cover picture, on TikTok's image hosts ([`image_url_allowed`]).
+    /// The cover picture, on TikTok's image hosts ([`image_url_allowed`]):
+    /// `originCover`, the same JPEG as `cover` at about a third of the
+    /// bytes, else `cover`.
     pub cover: Option<String>,
     pub renditions: Vec<Rendition>,
     /// The guest cookie its addresses need: its batch's (`feed::read`), as
@@ -137,7 +139,7 @@ impl Video {
             likes: stat("diggCount"),
             comments: stat("commentCount"),
             shares: stat("shareCount"),
-            cover: ["cover", "originCover"]
+            cover: ["originCover", "cover"]
                 .iter()
                 .filter_map(|key| video.get(*key).and_then(Value::as_str))
                 .find(|url| image_url_allowed(url))
