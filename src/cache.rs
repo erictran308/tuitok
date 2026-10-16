@@ -32,9 +32,9 @@ const REPORT_EVERY: u64 = 256 * 1024;
 /// What TikTok's video hosts are sent besides the guest cookie: Chrome's
 /// user agent and TikTok as the referrer, as its own page sends (tested
 /// with tokens from Lightpanda and from Chrome alike).
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
-const REFERER: &str = "https://www.tiktok.com/";
+pub const REFERER: &str = "https://www.tiktok.com/";
 
 /// Where a video's download is at.
 #[derive(Clone, Debug, PartialEq)]

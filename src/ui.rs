@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
@@ -60,6 +60,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// why there's nothing.
 fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
+    // Pepper shows the picture over the box: black under it, nothing else.
+    if app.picture_in_box() {
+        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
+        return;
+    }
     let lines = match app.current() {
         Some(video) => {
             let pixels = (
@@ -74,17 +79,14 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(what).fg(c.dim));
             }
-            lines.push(match app.downloads.get(&video.id) {
-                Some(Download::Getting { got, of: Some(of) }) if *of > 0 => {
-                    Line::from(format!("Downloading {}%", got * 100 / of)).fg(c.dim)
-                }
-                Some(Download::Getting { got, .. }) => {
-                    Line::from(format!("Downloading {}", size(*got))).fg(c.dim)
-                }
-                Some(Download::Ready(_)) => Line::from("Ready to play").fg(c.ok),
-                Some(Download::Streams) => Line::from("Too big to download: streams").fg(c.dim),
-                Some(Download::Failed(e)) => Line::from(format!("Download failed: {e}")).fg(c.red),
-                None => Line::from("Waiting to download").fg(c.dim),
+            lines.push(if let Some(e) = &app.play_error {
+                Line::from(e.clone()).fg(c.red)
+            } else if app.loading() {
+                Line::from("Loading…").fg(c.dim)
+            } else if app.shows_picture() {
+                Line::from("Playing in mpv's window").fg(c.ok)
+            } else {
+                download_line(app, &video.id)
             });
             lines
         }
@@ -104,6 +106,23 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
         height,
     );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+}
+
+/// How the download of video `id` is going.
+fn download_line(app: &App, id: &crate::video::VideoId) -> Line<'static> {
+    let c = &app.colors;
+    match app.downloads.get(id) {
+        Some(Download::Getting { got, of: Some(of) }) if *of > 0 => {
+            Line::from(format!("Downloading {}%", got * 100 / of)).fg(c.dim)
+        }
+        Some(Download::Getting { got, .. }) => {
+            Line::from(format!("Downloading {}", size(*got))).fg(c.dim)
+        }
+        Some(Download::Ready(_)) => Line::from("Ready to play").fg(c.ok),
+        Some(Download::Streams) => Line::from("Too big to download: streams").fg(c.dim),
+        Some(Download::Failed(e)) => Line::from(format!("Download failed: {e}")).fg(c.red),
+        None => Line::from("Waiting to download").fg(c.dim),
+    }
 }
 
 fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -145,15 +164,15 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             if !counts.is_empty() {
                 lines.push(Line::from(counts).fg(c.dim));
             }
-            lines.push(
-                Line::from(format!(
-                    "{} · {} of {}",
-                    clock(v.seconds),
-                    app.at + 1,
-                    app.videos.len()
-                ))
-                .fg(c.dim),
-            );
+            let at = format!("{} of {}", app.at + 1, app.videos.len());
+            let when = if app.shows_picture() {
+                let length = app.duration.map_or(v.seconds, |d| d.round() as u32);
+                let paused = if app.paused { " · paused" } else { "" };
+                format!("{} / {}{paused}", clock(app.position as u32), clock(length))
+            } else {
+                clock(v.seconds)
+            };
+            lines.push(Line::from(format!("{when} · {at}")).fg(c.dim));
         }
         None if app.pepper => lines.push(Line::from("In Pepper: videos play in the box").fg(c.ok)),
         None => lines.push(Line::from("Not in Pepper: videos will play in mpv's window").fg(c.red)),
@@ -180,7 +199,13 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
 fn hints(app: &App) -> Line<'static> {
     let c = &app.colors;
     let mut spans = Vec::new();
-    for (keys, what) in [("j k", "next/back"), ("r", "more"), ("q", "quit")] {
+    for (keys, what) in [
+        ("j k", "next/back"),
+        ("space", "pause"),
+        ("m", "mute"),
+        ("r", "more"),
+        ("q", "quit"),
+    ] {
         spans.push(Span::from(if spans.is_empty() { " " } else { "  " }));
         spans.push(Span::from(keys).fg(c.accent));
         spans.push(Span::from(format!(" {what}")).fg(c.dim));
@@ -309,7 +334,7 @@ pub mod tests {
         assert!(text.contains(" tuitok "));
         assert!(text.contains("Not in Pepper"));
         let last = text.lines().last().unwrap();
-        assert!(last.starts_with(" j k next/back  r more  q quit"));
+        assert!(last.starts_with(" j k next/back  space pause  m mute  r more  q quit"));
         assert!(last.contains("No browser for the feed"));
     }
 
@@ -360,6 +385,27 @@ pub mod tests {
             app.downloads.insert(id.clone(), state);
             assert!(screen(&app, 120, 40).contains(shown), "{shown}");
         }
+    }
+
+    #[test]
+    fn playing() {
+        let mut app = crate::app::tests::app_with(vec![video("1"), video("2")]);
+        // In mpv's window: the box says so, the panel says where it is.
+        crate::app::tests::set_playing(&mut app, "1", false);
+        app.position = 3.4;
+        app.paused = true;
+        let text = screen(&app, 120, 40);
+        assert!(text.contains("Playing in mpv's window"));
+        assert!(text.contains("0:03 / 1:15 · paused · 1 of 2"));
+        // In Pepper's box: nothing drawn in the box, where the picture goes.
+        crate::app::tests::set_playing(&mut app, "1", true);
+        let text = screen(&app, 120, 40);
+        assert!(!text.contains("Playing in mpv's window") && !text.contains("H.265"));
+        assert!(text.contains("0:03 / 1:15 · paused · 1 of 2"));
+        // Why a video doesn't play.
+        app.playing = None;
+        app.play_error = Some("It can't play: loading failed".into());
+        assert!(screen(&app, 120, 40).contains("It can't play: loading failed"));
     }
 
     #[test]

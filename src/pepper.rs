@@ -4,12 +4,16 @@
 //! `ESC ] 777 ; pepper ; place ; TOKEN ; COL ; ROW ; COLS ; ROWS ESC \`
 //! (`../pepper/pepper-play/README.md`), as tuitube does
 //! (`../tuitube/src/pepper.rs`, where the token and the sequences come from
-//! when the player lands). For now: whether tuitok runs in Pepper, and the
-//! box's shape.
+//! when the player lands): whether tuitok runs in Pepper, the box's shape,
+//! the token that ties pepper-play's picture to the box, and the sequences
+//! that place the box and take it away.
 
 use std::ffi::OsString;
 
 use ratatui::layout::Rect;
+
+/// The token's random bytes (32 hex digits).
+const TOKEN_BYTES: usize = 16;
 
 /// What a terminal multiplexer running tuitok sets: tmux, GNU screen,
 /// zellij. Each would need every escape sequence wrapped to pass it on, and
@@ -27,6 +31,39 @@ fn port_from(var: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
         return None;
     }
     var("PEPPER_PORT").filter(|port| !port.is_empty())
+}
+
+/// A token for one player's picture: random hex digits, as Pepper takes
+/// them (1–64 of `[A-Za-z0-9_-]`). It goes to pepper-play over its socket
+/// only, and to Pepper only in tuitok's own sequences to its tab. `None` if
+/// the system's randomness can't be read.
+pub fn new_token() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; TOKEN_BYTES];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Puts the picture of `token`'s player over `area`.
+pub fn place(token: &str, area: Rect) -> String {
+    format!(
+        "\x1b]777;pepper;place;{token};{};{};{};{}\x1b\\",
+        area.x, area.y, area.width, area.height
+    )
+}
+
+/// Takes the picture of `token`'s player away.
+pub fn remove(token: &str) -> String {
+    format!("\x1b]777;pepper;remove;{token}\x1b\\")
+}
+
+/// What Pepper was last told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub token: String,
+    pub area: Rect,
 }
 
 /// The tallest 9:16 box that fits in `area` for cells of `cell` pixels,
@@ -84,6 +121,20 @@ mod tests {
                 "{multiplexer}"
             );
         }
+    }
+
+    #[test]
+    fn tokens_are_fresh_hex_and_sequences_carry_only_cells() {
+        let (a, b) = (new_token().unwrap(), new_token().unwrap());
+        assert_eq!(a.len(), 2 * TOKEN_BYTES);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        let area = Rect::new(2, 3, 40, 11);
+        assert_eq!(
+            place("ab", area),
+            "\x1b]777;pepper;place;ab;2;3;40;11\x1b\\"
+        );
+        assert_eq!(remove("ab"), "\x1b]777;pepper;remove;ab\x1b\\");
     }
 
     #[test]

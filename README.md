@@ -10,7 +10,7 @@ No account, no login.
 </div>
 
 > [!WARNING]
-> **Early.** The feed works: `tuitok` shows TikTok's For You one video at a time (author, caption, sound, counts), downloading the next few ahead, and `tuitok --feed` lists a batch. Playing comes next: [the plan](reports/TikTok%20terminal%20client.md#the-plan).
+> **Early.** It plays: `tuitok` in a Pepper tab shows TikTok's For You one video at a time in an upright box beside its author, caption, sound and counts, the next few downloaded ahead so they start at once (elsewhere, videos play in mpv's window). Still to come: cover pictures, `--demo`, and polish ([the plan](reports/TikTok%20terminal%20client.md#the-plan)).
 
 > [!IMPORTANT]
 > **For personal use only.** tuitok isn't made, endorsed or allowed by TikTok or ByteDance. It reads TikTok's web feed through a headless browser, which TikTok's terms don't permit. It never logs in. See the [disclaimer](#disclaimer).
@@ -23,11 +23,16 @@ No account, no login.
 
 Why a terminal: measured on an M5 Pro, TikTok in a Chrome window used 49% of a core and 1.5 GB. The parts of tuitok, measured the same way: Pepper's player 10% and 220 MB, a ratatui app 2.5% and 40 MB, and Lightpanda 3.4 s of CPU and 290 MB for 14 s to fetch ~27 videos. The [report](reports/TikTok%20terminal%20client.md) has every number and how it was measured.
 
+## Keys
+
+`j` or `↓` the next video, `k` or `↑` the one before, `space` pause, `m` mute, `h` `l` or `←` `→` back and on 5 s, `r` fetch more, `q` quit.
+
 ## Get started (for now)
 
 ```sh
 brew install mpv lightpanda-io/browser/lightpanda
-cargo run -- --check
+cargo run -- --check   # what tuitok found
+cargo run              # in a Pepper tab
 ```
 
 ## Disclaimer

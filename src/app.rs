@@ -1,9 +1,10 @@
 //! What tuitok holds, and its event loop: one `tokio::select!` over the
 //! terminal's events and tuitok's own (a batch of the feed, a download's
-//! progress and end), a redraw after each.
+//! progress and end, what the player says), a redraw after each, and after
+//! the frame, in Pepper, where the picture goes.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use crate::browser::Engine;
 use crate::cache::{self, Download};
 use crate::config::Session;
 use crate::feed::{self, Batch};
+use crate::pepper::{self, Placed};
+use crate::player::{Kind, Player, PlayerEvent, Target};
 use crate::text;
 use crate::theme::{self, Colors};
 use crate::ui;
@@ -37,6 +40,11 @@ const REFILL_AT: usize = 5;
 /// tries at once).
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// How far `h` and `l` seek, in seconds.
+const SEEK: f64 = 5.0;
+
+const NO_PLAYER: &str = "No player: brew install mpv";
+
 /// What tuitok's own tasks tell the event loop.
 pub enum AppEvent {
     Batch(Result<Batch, String>),
@@ -50,6 +58,11 @@ pub enum AppEvent {
     Downloaded {
         id: VideoId,
         outcome: Download,
+    },
+    /// What player number `player` said: an older player's words are dropped.
+    Player {
+        player: u64,
+        event: PlayerEvent,
     },
 }
 
@@ -78,7 +91,7 @@ enum Step {
 
 pub struct App {
     pub colors: Colors,
-    /// tuitok runs in Pepper (`pepper::port`): videos will play in the box.
+    /// tuitok runs in Pepper (`pepper::port`).
     pub pepper: bool,
     /// A cell's size in pixels, and the terminal's size in cells: the box's
     /// size in pixels comes from both.
@@ -91,6 +104,14 @@ pub struct App {
     pub feed: FeedState,
     /// Downloads by video: started, ready, to stream or failed.
     pub downloads: HashMap<VideoId, Download>,
+    /// The video the player shows (its first frame came), where it is in
+    /// it, how long it is, and whether it's paused.
+    pub playing: Option<VideoId>,
+    pub position: f64,
+    pub duration: Option<f64>,
+    pub paused: bool,
+    /// Why the player couldn't start, or the video shown can't play.
+    pub play_error: Option<String>,
     engines: Vec<(Engine, PathBuf)>,
     profile: PathBuf,
     cache: PathBuf,
@@ -99,6 +120,18 @@ pub struct App {
     failed_at: Option<Instant>,
     /// Downloads running.
     running: usize,
+    /// The program to play with and how (`main` decides: pepper-play in
+    /// Pepper, else mpv's window), the player once started, how many have
+    /// been started (each one's events carry its number), and what it was
+    /// told to play.
+    player_with: Option<(PathBuf, Kind)>,
+    player: Option<Player>,
+    players: u64,
+    loaded: Option<VideoId>,
+    /// Pepper's token for the player's picture (pepper-play only), and what
+    /// Pepper was last told.
+    token: Option<String>,
+    placed: Option<Placed>,
     /// The client for the videos, and where tasks send `AppEvent`s, once
     /// `run` has started.
     client: Option<reqwest::Client>,
@@ -109,8 +142,13 @@ pub struct App {
 impl App {
     /// `engines` are the browsers to fetch the feed with, in order
     /// (`feed::engines`); `session` has the folders for Chrome's profile and
-    /// the downloads.
-    pub fn new(pepper: bool, engines: Vec<(Engine, PathBuf)>, session: &Session) -> Self {
+    /// the downloads; `player_with` is what plays, if anything can.
+    pub fn new(
+        pepper: bool,
+        engines: Vec<(Engine, PathBuf)>,
+        session: &Session,
+        player_with: Option<(PathBuf, Kind)>,
+    ) -> Self {
         let feed = match engines.first() {
             Some(&(engine, _)) => FeedState::Fetching(engine),
             None => FeedState::NoBrowser,
@@ -124,6 +162,11 @@ impl App {
             at: 0,
             feed,
             downloads: HashMap::new(),
+            playing: None,
+            position: 0.0,
+            duration: None,
+            paused: false,
+            play_error: None,
             engines,
             profile: session.profile.clone(),
             cache: session.cache.clone(),
@@ -131,6 +174,12 @@ impl App {
             fetching: false,
             failed_at: None,
             running: 0,
+            player_with,
+            player: None,
+            players: 0,
+            loaded: None,
+            token: None,
+            placed: None,
             client: None,
             tx: None,
             quit: false,
@@ -145,6 +194,8 @@ impl App {
         let mut terminal_events = EventStream::new();
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, self))?;
+            let placement = self.placement();
+            write_to_terminal(&placement)?;
             tokio::select! {
                 event = terminal_events.next() => match event {
                     Some(Ok(event)) => self.on_event(event),
@@ -154,6 +205,12 @@ impl App {
                 Some(event) = app_events.recv() => self.on_app_event(event),
             }
         }
+        if let Some(placed) = self.placed.take() {
+            write_to_terminal(&pepper::remove(&placed.token))?;
+        }
+        if let Some(player) = self.player.take() {
+            player.quit().await;
+        }
         Ok(())
     }
 
@@ -162,13 +219,36 @@ impl App {
         self.videos.get(self.at)
     }
 
-    /// The video box's size in pixels, laid out as `ui::draw` lays it out.
+    /// The video box, laid out as `ui::draw` lays it out.
+    fn video_area(&self) -> Rect {
+        ui::areas(Rect::new(0, 0, self.size.0, self.size.1), self.cell).video
+    }
+
+    /// The video box's size in pixels.
     pub fn box_pixels(&self) -> (u32, u32) {
-        let video = ui::areas(Rect::new(0, 0, self.size.0, self.size.1), self.cell).video;
+        let video = self.video_area();
         (
             u32::from(video.width) * u32::from(self.cell.0),
             u32::from(video.height) * u32::from(self.cell.1),
         )
+    }
+
+    /// Whether the player shows the video shown.
+    pub fn shows_picture(&self) -> bool {
+        self.playing.is_some() && self.playing.as_ref() == self.current().map(|v| &v.id)
+    }
+
+    /// Whether that picture is in Pepper's box (not in mpv's window).
+    pub fn picture_in_box(&self) -> bool {
+        self.shows_picture() && self.token.is_some()
+    }
+
+    /// Whether the player was told to play the video shown and has no
+    /// frame of it yet.
+    pub fn loading(&self) -> bool {
+        self.loaded.is_some()
+            && self.loaded.as_ref() == self.current().map(|v| &v.id)
+            && !self.shows_picture()
     }
 
     /// Starts fetching a batch, unless one is being fetched.
@@ -195,6 +275,7 @@ impl App {
             AppEvent::Batch(batch) => {
                 self.on_batch(batch);
                 self.prefetch();
+                self.play_current();
             }
             AppEvent::Progress { id, got, of } => {
                 if let Some(Download::Getting {
@@ -210,7 +291,10 @@ impl App {
                 self.running = self.running.saturating_sub(1);
                 self.downloads.insert(id, outcome);
                 self.prefetch();
+                self.play_current();
             }
+            AppEvent::Player { player, event } if player == self.players => self.on_player(event),
+            AppEvent::Player { .. } => {}
         }
     }
 
@@ -238,6 +322,141 @@ impl App {
                 self.failed_at = Some(Instant::now());
             }
         }
+    }
+
+    fn on_player(&mut self, event: PlayerEvent) {
+        match event {
+            PlayerEvent::Restarted => self.playing = self.loaded.clone(),
+            PlayerEvent::Position(seconds) => self.position = seconds,
+            PlayerEvent::Duration(seconds) => self.duration = Some(seconds),
+            PlayerEvent::Paused(paused) => self.paused = paused,
+            PlayerEvent::Failed(e) => {
+                self.playing = None;
+                self.play_error = Some(format!("It can't play: {e}"));
+            }
+            PlayerEvent::Exited => {
+                self.player = None;
+                self.token = None;
+                self.loaded = None;
+                self.playing = None;
+            }
+        }
+    }
+
+    /// What would play for the video shown, if it can play yet: its file
+    /// once downloaded, else its address streamed (too big to download, or
+    /// the download failed).
+    fn target(&self) -> Option<Target> {
+        let video = self.current()?;
+        match self.downloads.get(&video.id)? {
+            Download::Ready(path) => Some(Target::File(path.clone())),
+            Download::Streams | Download::Failed(_) => {
+                let url = video.best(self.box_pixels())?.urls.first()?.clone();
+                Some(Target::Stream {
+                    url,
+                    token: video.token.clone(),
+                })
+            }
+            Download::Getting { .. } => None,
+        }
+    }
+
+    /// Plays the video shown if it can and isn't already; while it can't
+    /// yet, the player stops, so the last one doesn't play on under it.
+    fn play_current(&mut self) {
+        let Some(id) = self.current().map(|v| v.id.clone()) else {
+            return;
+        };
+        if self.loaded.as_ref() == Some(&id) {
+            return;
+        }
+        let Some(target) = self.target() else {
+            self.stop_playing();
+            return;
+        };
+        if !self.start_player() {
+            return;
+        }
+        if let Some(player) = &self.player {
+            player.load(&target);
+        }
+        self.loaded = Some(id);
+        self.playing = None;
+        self.position = 0.0;
+        self.duration = None;
+        self.paused = false;
+        self.play_error = None;
+    }
+
+    fn stop_playing(&mut self) {
+        if self.loaded.take().is_some()
+            && let Some(player) = &self.player
+        {
+            player.stop();
+        }
+        self.playing = None;
+    }
+
+    /// Starts the player unless it runs; whether it runs.
+    fn start_player(&mut self) -> bool {
+        if self.player.is_some() {
+            return true;
+        }
+        let Some((program, kind)) = self.player_with.clone() else {
+            self.play_error = Some(NO_PLAYER.into());
+            return false;
+        };
+        let Some(tx) = self.tx.clone() else {
+            return false;
+        };
+        self.players += 1;
+        let number = self.players;
+        let said = move |event| {
+            let _ = tx.send(AppEvent::Player {
+                player: number,
+                event,
+            });
+        };
+        match Player::start(&program, &kind, said) {
+            Ok(player) => {
+                self.token = player.token.clone();
+                self.player = Some(player);
+                true
+            }
+            Err(e) => {
+                self.play_error = Some(text::one_line(&format!("{e:#}"), 200));
+                false
+            }
+        }
+    }
+
+    /// What to tell Pepper after a frame: the picture placed over the box
+    /// while the video shown plays (placed again when the box moves), taken
+    /// away otherwise. Empty when nothing changed, and always outside
+    /// Pepper (no token).
+    fn placement(&mut self) -> String {
+        let want = self
+            .token
+            .clone()
+            .filter(|_| self.shows_picture())
+            .map(|token| Placed {
+                token,
+                area: self.video_area(),
+            });
+        if want == self.placed {
+            return String::new();
+        }
+        let mut out = String::new();
+        if let Some(old) = &self.placed
+            && want.as_ref().is_none_or(|want| want.token != old.token)
+        {
+            out.push_str(&pepper::remove(&old.token));
+        }
+        if let Some(want) = &want {
+            out.push_str(&pepper::place(&want.token, want.area));
+        }
+        self.placed = want;
+        out
     }
 
     /// What to do so the video shown and the `cache::AHEAD` after it are
@@ -349,11 +568,24 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.go(1),
             KeyCode::Char('k') | KeyCode::Up => self.go(-1),
+            KeyCode::Char(' ') => self.with_player(Player::toggle_pause),
+            KeyCode::Char('m') => self.with_player(Player::toggle_mute),
+            KeyCode::Char('h') | KeyCode::Left => self.with_player(|p| p.seek(-SEEK)),
+            KeyCode::Char('l') | KeyCode::Right => self.with_player(|p| p.seek(SEEK)),
             KeyCode::Char('r') => {
                 self.failed_at = None;
                 self.fetch_more();
             }
             _ => {}
+        }
+    }
+
+    /// `act` on the player, while it shows the video shown.
+    fn with_player(&self, act: impl Fn(&Player)) {
+        if let Some(player) = &self.player
+            && self.shows_picture()
+        {
+            act(player);
         }
     }
 
@@ -365,6 +597,7 @@ impl App {
         self.at = self.at.saturating_add_signed(by).min(self.videos.len() - 1);
         self.prune();
         self.prefetch();
+        self.play_current();
         self.refill();
     }
 
@@ -376,6 +609,16 @@ impl App {
             self.fetch_more();
         }
     }
+}
+
+/// Writes tuitok's own sequences to the terminal, after ratatui's frame.
+fn write_to_terminal(text: &str) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut out = io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()
 }
 
 /// A cell's size in pixels: the terminal's size in pixels over its size in
@@ -391,6 +634,8 @@ fn cell_size() -> (u16, u16) {
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::video::Rendition;
 
@@ -400,7 +645,7 @@ pub mod tests {
             profile: PathBuf::from("/nowhere/chrome"),
             cache: PathBuf::from("/nowhere/cache"),
         };
-        let mut app = App::new(false, Vec::new(), &session);
+        let mut app = App::new(false, Vec::new(), &session, None);
         app.cell = GUESSED_CELL;
         app.size = GUESSED_SIZE;
         app.on_batch(Ok(Batch {
@@ -411,6 +656,18 @@ pub mod tests {
             note: None,
         }));
         app
+    }
+
+    /// The player shows video `id`: in Pepper's box, or in mpv's window.
+    pub fn set_playing(app: &mut App, id: &str, in_box: bool) {
+        let id = VideoId::new(id).unwrap();
+        app.loaded = Some(id.clone());
+        app.playing = Some(id);
+        if in_box {
+            app.token = Some("t0k".into());
+        } else {
+            app.player_with = Some((PathBuf::from("/opt/homebrew/bin/mpv"), Kind::Window));
+        }
     }
 
     #[test]
@@ -512,5 +769,92 @@ pub mod tests {
                 of: Some(1_000)
             }
         );
+    }
+
+    #[test]
+    fn what_plays_is_the_file_once_downloaded_else_the_stream() {
+        let mut video = crate::ui::tests::video("1");
+        video.token = Some(Arc::from("tok"));
+        let mut app = app_with(vec![video]);
+        let id = VideoId::new("1").unwrap();
+        assert_eq!(app.target(), None);
+        app.downloads
+            .insert(id.clone(), Download::Getting { got: 1, of: None });
+        assert_eq!(app.target(), None);
+        app.downloads
+            .insert(id.clone(), Download::Ready("/nowhere/cache/1.mp4".into()));
+        assert_eq!(
+            app.target(),
+            Some(Target::File("/nowhere/cache/1.mp4".into()))
+        );
+        let stream = Some(Target::Stream {
+            url: "https://v16-webapp-prime.tiktok.com/x".into(),
+            token: Some(Arc::from("tok")),
+        });
+        app.downloads.insert(id.clone(), Download::Streams);
+        assert_eq!(app.target(), stream);
+        app.downloads
+            .insert(id, Download::Failed("HTTP 403".into()));
+        assert_eq!(app.target(), stream);
+        // With no player to play with, it says so.
+        app.play_current();
+        assert_eq!(app.play_error.as_deref(), Some(NO_PLAYER));
+    }
+
+    #[test]
+    fn pepper_is_told_where_the_picture_goes_only_when_it_changes() {
+        let mut app = app_with(vec![
+            crate::ui::tests::video("1"),
+            crate::ui::tests::video("2"),
+        ]);
+        assert_eq!(app.placement(), "");
+        set_playing(&mut app, "1", true);
+        let area = app.video_area();
+        assert_eq!(app.placement(), pepper::place("t0k", area));
+        assert_eq!(app.placement(), "");
+        // The window grew: placed again.
+        app.size = (150, 50);
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        // Another video shown, not playing yet: taken away.
+        app.at = 1;
+        assert_eq!(app.placement(), pepper::remove("t0k"));
+        assert_eq!(app.placement(), "");
+    }
+
+    #[test]
+    fn the_players_words() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        app.loaded = Some(VideoId::new("1").unwrap());
+        app.players = 2;
+        app.on_app_event(AppEvent::Player {
+            player: 2,
+            event: PlayerEvent::Restarted,
+        });
+        assert!(app.shows_picture());
+        app.on_app_event(AppEvent::Player {
+            player: 2,
+            event: PlayerEvent::Paused(true),
+        });
+        assert!(app.paused);
+        // An older player's words are dropped.
+        app.on_app_event(AppEvent::Player {
+            player: 1,
+            event: PlayerEvent::Exited,
+        });
+        assert!(app.shows_picture());
+        app.on_app_event(AppEvent::Player {
+            player: 2,
+            event: PlayerEvent::Failed("loading failed".into()),
+        });
+        assert!(!app.shows_picture());
+        assert_eq!(
+            app.play_error.as_deref(),
+            Some("It can't play: loading failed")
+        );
+        app.on_app_event(AppEvent::Player {
+            player: 2,
+            event: PlayerEvent::Exited,
+        });
+        assert!(app.loaded.is_none() && app.token.is_none());
     }
 }

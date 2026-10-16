@@ -9,6 +9,7 @@ mod cdp;
 mod config;
 mod feed;
 mod pepper;
+mod player;
 mod text;
 mod theme;
 mod tools;
@@ -31,7 +32,8 @@ Usage: tuitok [--check | --feed [lightpanda | chrome] | --help | --version]
   --help      print this
   --version   print tuitok's version
 
-Keys: j or ↓ the next video, k or ↑ the one before, r fetch more, q quit.
+Keys: j or ↓ the next video, k or ↑ the one before, space pause, m mute,
+h or ← and l or → back and on 5 s, r fetch more, q quit.
 
 tuitok isn't made or endorsed by TikTok or ByteDance.";
 
@@ -99,8 +101,16 @@ fn run() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => return fail(&e.into()),
     };
-    let engines = feed::engines(&tools::Tools::find(), None);
-    let mut app = app::App::new(pepper::port().is_some(), engines, &session);
+    let tools = tools::Tools::find();
+    let port = pepper::port();
+    // pepper-play in Pepper, else mpv in its window.
+    let player_with = match (&port, &tools.pepper_play, &tools.mpv) {
+        (Some(port), Some(play), _) => Some((play.clone(), player::Kind::Pepper(port.clone()))),
+        (_, _, Some(mpv)) => Some((mpv.clone(), player::Kind::Window)),
+        _ => None,
+    };
+    let engines = feed::engines(&tools, None);
+    let mut app = app::App::new(port.is_some(), engines, &session, player_with);
     let mut terminal = ratatui::init();
     let result = runtime.block_on(app.run(&mut terminal));
     ratatui::restore();

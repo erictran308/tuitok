@@ -1,0 +1,6 @@
+#!/bin/sh
+# mpv with no window and no sound: what TUITOK_MPV points at to try tuitok's
+# player end to end without anything showing or playing aloud.
+#
+#   TUITOK_MPV="$PWD/tools/mpv-silent" cargo run   (or tools/drive.py, which says how)
+exec /opt/homebrew/bin/mpv "$@" --vo=null --ao=null --force-window=no
