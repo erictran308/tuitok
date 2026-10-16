@@ -9,8 +9,8 @@ readme = "README.md"
 rust-version = "1.90"
 keywords = ["tiktok", "tui", "terminal", "mpv", "vim"]
 categories = ["command-line-utilities"]
-# What goes into the published crate, and nothing else (no research notes,
-# spikes or stray files).
+# What goes into the published crate, and nothing else (no docs, tools,
+# tests' data or stray files).
 include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "Cargo.toml", "Cargo.lock"]
 
 [[bin]]

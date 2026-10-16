@@ -1,6 +1,6 @@
 //! The headless browser a batch of the feed is fetched with: Lightpanda,
-//! else Chrome. Started for one batch and closed after (the report measured
-//! the browser as tuitok's expensive part), with a cleaned environment, in a
+//! else Chrome. Started for one batch and closed after (measured, the
+//! browser is tuitok's expensive part), with a cleaned environment, in a
 //! process group of its own that's killed as a whole, also when a batch is
 //! dropped half way (`Drop`).
 
@@ -48,8 +48,8 @@ const START_WAIT: Duration = Duration::from_secs(10);
 
 /// Chrome's flags: headless, its DevTools on the pipe, nothing of Chrome's
 /// own over the network (updates, sync, translation, metrics), no Keychain
-/// prompt for the profile, no pictures or sound, and fewer processes (the
-/// report's "Lighter browsers": site isolation off, one renderer, the GPU
+/// prompt for the profile, no pictures or sound, and fewer processes (measured
+/// lighter: site isolation off, one renderer, the GPU
 /// in the browser's process).
 const CHROME_FLAGS: [&str; 20] = [
     "--headless",

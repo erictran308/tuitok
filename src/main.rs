@@ -1,6 +1,6 @@
 //! tuitok: TikTok's For You feed in the terminal, one upright video at a
-//! time, playing inside Pepper (`../pepper`). The research behind it is
-//! `reports/TikTok terminal client.md`.
+//! time, playing inside Pepper (`../pepper`). CLAUDE.md has the research
+//! behind it, in short.
 
 mod app;
 mod browser;

@@ -4,7 +4,7 @@
 //! `Network.getResponseBody`), and the guest `tt_chain_token` cookie their
 //! addresses need. Pictures, fonts, video and sound are refused and `play()`
 //! does nothing: TikTok streams through MediaSource with fetch, so refusing
-//! "Media" alone stops nothing (the report's "What it costs").
+//! "Media" alone stops nothing (measured: CLAUDE.md, "Research, in short").
 //!
 //! A batch hands on each answer's videos as they come (`Tell`), once the
 //! cookie is in: the page's first answer comes about 1.5 s after it opens.

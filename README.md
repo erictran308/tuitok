@@ -62,7 +62,7 @@ TikTok in a browser is heavy. Measured on an Apple M5 Pro the way Pepper's own b
 | A ratatui app like tuitok, on screen | 2.5% | 40 MB |
 | **tuitok in Pepper, all of it** | **about 18%** | **about 260 MB** |
 
-The browser that fetches the feed runs only while it fetches: Lightpanda takes 1.6 s and 0.7 s of CPU for the first video, and about 10 s, 2.4 s of CPU and under 300 MB for a batch of 13, then closes. The [report](reports/TikTok%20terminal%20client.md) has every number, how it was measured, and its caveats.
+The browser that fetches the feed runs only while it fetches: Lightpanda takes 1.6 s and 0.7 s of CPU for the first video, and about 10 s, 2.4 s of CPU and under 300 MB for a batch of 13, then closes.
 
 ## Get started
 

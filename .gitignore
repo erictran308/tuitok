@@ -4,7 +4,11 @@
 .env
 .tuitok/
 
-# The spikes' Python caches.
+# The research behind tuitok (the report, the scripts that measured it and
+# their raw numbers): kept on this computer, not published. CLAUDE.md has it
+# in short; the first commit has it whole.
+/reports/
+/research_notes/
 __pycache__/
 
 # Local AI tool folders: never committed or published.
