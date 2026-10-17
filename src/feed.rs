@@ -446,7 +446,7 @@ fn chain_token(cookies: &Value) -> Option<String> {
 
 /// Whether `s` can go in a `Cookie` header as it is: 1 to `max` bytes, none
 /// that would end or break it.
-fn fits_header(s: &str, max: usize) -> bool {
+pub fn fits_header(s: &str, max: usize) -> bool {
     let fits = |b: u8| b.is_ascii_graphic() && !matches!(b, b';' | b',' | b'"' | b'\\');
     (1..=max).contains(&s.len()) && s.bytes().all(fits)
 }

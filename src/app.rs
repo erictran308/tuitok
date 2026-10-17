@@ -25,6 +25,7 @@ use crate::comments::{self, Comment, Comments};
 use crate::config::Session;
 use crate::covers::{self, Cover, Encoded};
 use crate::demo;
+use crate::explore::{self, Category};
 use crate::feed::{self, Batch};
 use crate::pepper::{self, Placed};
 use crate::player::{Kind, Player, PlayerEvent, Sound, Target};
@@ -61,12 +62,20 @@ const VOLUME_STEP: u32 = 5;
 
 const NO_PLAYER: &str = "No player: brew install mpv";
 
+/// The most characters the command line (`/`) takes.
+const MAX_SEARCH: usize = 40;
+
 /// What tuitok's own tasks tell the event loop.
 pub enum AppEvent {
     /// Videos of the batch being fetched, as the page gets them.
     Found(Vec<Video>),
     /// The batch ended.
     Batch(Result<Batch, String>),
+    /// A page of a category's videos came, or didn't.
+    Explored {
+        category: Category,
+        page: Result<explore::Page, String>,
+    },
     /// How far a download has got.
     Progress {
         id: VideoId,
@@ -111,7 +120,23 @@ pub enum FeedState {
         took: Duration,
         note: Option<String>,
     },
+    /// A page of a category being fetched (no browser: `explore`).
+    Exploring,
+    /// The category's last page: the videos it added, and how long it took.
+    Explored {
+        new: usize,
+        took: Duration,
+    },
     Failed(String),
+}
+
+/// What For You's status is before its first batch: fetching with the
+/// first of `engines`, or nothing to fetch with.
+fn first_state(engines: &[(Engine, PathBuf)]) -> FeedState {
+    match engines.first() {
+        Some(&(engine, _)) => FeedState::Fetching(engine),
+        None => FeedState::NoBrowser,
+    }
 }
 
 /// A step towards having the next videos downloaded ([`App::plan`]).
@@ -141,6 +166,16 @@ pub struct HelpMenu {
     pub error: Option<String>,
 }
 
+/// The command line while it's open (`/`): what's typed, the row under the
+/// cursor in what it matches (`explore::matching`), and the first row its
+/// box shows (drawing keeps the cursor in view).
+#[derive(Debug, Default, PartialEq)]
+pub struct Search {
+    pub text: String,
+    pub selected: usize,
+    pub scroll: Cell<usize>,
+}
+
 pub struct App {
     pub colors: Colors,
     /// The theme in use (its id in `theme::BUILT_IN`), the data folder
@@ -155,6 +190,14 @@ pub struct App {
     /// size in pixels comes from both.
     pub cell: (u16, u16),
     pub size: (u16, u16),
+    /// What the feed is: For You (`None`), or one of Explore's categories,
+    /// picked on the command line `/` opens; and that while it's open.
+    pub category: Option<Category>,
+    pub search: Option<Search>,
+    /// The guest Explore's pages are fetched as, once there is one (only in
+    /// memory), and the category whose page is being fetched.
+    explore_guest: Option<explore::Guest>,
+    exploring: Option<Category>,
     /// The feed so far, each video once.
     pub videos: Vec<Video>,
     /// The video shown.
@@ -174,8 +217,9 @@ pub struct App {
     profile: PathBuf,
     cache: PathBuf,
     seen: HashSet<VideoId>,
-    /// What the last run's guest watched (`guest.rs`), and the furthest
-    /// video shown in this run: handed to the next run.
+    /// What was watched before the feed shown (what the last run's guest
+    /// watched, `guest.rs`, then this run's feeds before), and the furthest
+    /// video shown in this one: handed to the next run.
     watched_before: Vec<VideoId>,
     furthest: usize,
     fetching: bool,
@@ -219,10 +263,10 @@ pub struct App {
     pub covers: HashMap<VideoId, Cover>,
     picker: Option<Picker>,
     cover_client: Option<reqwest::Client>,
-    /// Top comments by video, and the client for `www.tiktok.com`'s
-    /// comment list.
+    /// Top comments by video, and the client for `www.tiktok.com`: its
+    /// comment list, and Explore's pages.
     pub comments: HashMap<VideoId, Comments>,
-    comment_client: Option<reqwest::Client>,
+    www_client: Option<reqwest::Client>,
     /// `f` in Pepper: the video fills the tab.
     pub fullscreen: bool,
     /// `--demo`: made-up videos, nothing fetched, downloaded or played.
@@ -247,10 +291,7 @@ impl App {
         session: &Session,
         player_with: Option<(PathBuf, Kind)>,
     ) -> Self {
-        let feed = match engines.first() {
-            Some(&(engine, _)) => FeedState::Fetching(engine),
-            None => FeedState::NoBrowser,
-        };
+        let feed = first_state(&engines);
         Self {
             colors: Colors::named(theme::DEFAULT),
             theme: theme::DEFAULT,
@@ -259,6 +300,10 @@ impl App {
             pepper,
             cell: cell_size(),
             size: crossterm::terminal::size().unwrap_or(GUESSED_SIZE),
+            category: None,
+            search: None,
+            explore_guest: None,
+            exploring: None,
             videos: Vec::new(),
             at: 0,
             feed,
@@ -296,7 +341,7 @@ impl App {
             picker: None,
             cover_client: None,
             comments: HashMap::new(),
-            comment_client: None,
+            www_client: None,
             fullscreen: false,
             demo: false,
             behind_multiplexer: None,
@@ -312,7 +357,7 @@ impl App {
         if !self.demo {
             self.client = Some(cache::client(crate::video::video_url_allowed));
             self.cover_client = Some(cache::client(crate::video::image_url_allowed));
-            self.comment_client = Some(cache::client(comments::url_allowed));
+            self.www_client = Some(cache::client(crate::video::www_url_allowed));
         }
         self.want_covers();
         self.want_comments();
@@ -350,6 +395,16 @@ impl App {
     /// The video shown, if there is one.
     pub fn current(&self) -> Option<&Video> {
         self.videos.get(self.at)
+    }
+
+    /// Whether video `id` is in the feed shown.
+    fn shows(&self, id: &VideoId) -> bool {
+        self.videos.iter().any(|v| &v.id == id)
+    }
+
+    /// What the feed shown is called: For You, or its category's name.
+    pub fn feed_name(&self) -> &'static str {
+        explore::name(self.category)
     }
 
     /// Where things go, laid out as `ui::draw` lays them out.
@@ -483,9 +538,20 @@ impl App {
     }
 
     /// Whether that picture is in Pepper's box (not in mpv's window): not
-    /// while the `?` popup is open, which it would cover (as in tuitube).
+    /// while the `?` popup is open, or the categories' box where it's over
+    /// the video, which they'd cover (as in tuitube).
     pub fn picture_in_box(&self) -> bool {
-        self.shows_picture() && self.token.is_some() && self.help.is_none()
+        self.shows_picture()
+            && self.token.is_some()
+            && self.help.is_none()
+            && !self.offers_cover_video()
+    }
+
+    /// Whether the categories' box (`/`) is open over the video's side: it
+    /// goes over the panel, so the video plays on beside it, but where
+    /// there's no panel (a narrow window, or `f`) it's over the video.
+    pub fn offers_cover_video(&self) -> bool {
+        self.search.is_some() && self.areas().panel.is_none()
     }
 
     /// Whether the player was told to play the video shown and has no
@@ -496,8 +562,35 @@ impl App {
             && !self.shows_picture()
     }
 
-    /// Starts fetching the next batch, unless one is being fetched.
+    /// Starts fetching more of the feed shown, unless that's under way.
     fn fetch_more(&mut self) {
+        match self.category {
+            Some(category) => self.explore(category),
+            None => self.fetch_for_you(),
+        }
+    }
+
+    /// Starts fetching a page of `category`, unless one is being fetched.
+    fn explore(&mut self, category: Category) {
+        if self.exploring == Some(category) {
+            return;
+        }
+        let (Some(client), Some(tx)) = (self.www_client.clone(), self.tx.clone()) else {
+            return;
+        };
+        self.exploring = Some(category);
+        self.feed = FeedState::Exploring;
+        let guest = self.explore_guest.clone();
+        tokio::spawn(async move {
+            let page = explore::fetch(&client, category, guest)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::Explored { category, page });
+        });
+    }
+
+    /// Starts fetching For You's next batch, unless one is being fetched.
+    fn fetch_for_you(&mut self) {
         if self.fetching {
             return;
         }
@@ -560,20 +653,33 @@ impl App {
 
     fn on_app_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Found(videos) => {
+            // For You's videos, while it's shown.
+            AppEvent::Found(videos) if self.category.is_none() => {
                 self.add(videos);
                 self.prefetch();
                 self.want_covers();
                 self.want_comments();
                 self.play_current();
             }
-            AppEvent::Batch(batch) => {
+            AppEvent::Found(_) => {}
+            AppEvent::Batch(batch) if self.category.is_none() => {
                 self.on_batch(batch);
                 self.prefetch();
                 self.want_covers();
                 self.want_comments();
                 self.play_current();
             }
+            AppEvent::Batch(batch) => self.put_batch_aside(batch),
+            AppEvent::Explored { category, page } => {
+                self.on_explored(category, page);
+                self.prefetch();
+                self.want_covers();
+                self.want_comments();
+                self.play_current();
+            }
+            // What comes for a video of a feed no longer shown is dropped.
+            AppEvent::CommentsFetched { id, .. } | AppEvent::CoverFetched { id, .. }
+                if !self.shows(&id) => {}
             AppEvent::CommentsFetched { id, comments } => {
                 let comments = comments.map_or(Comments::Failed, Comments::Ready);
                 self.comments.insert(id, comments);
@@ -587,6 +693,13 @@ impl App {
                     *was = got;
                     *total = of.or(*total);
                 }
+            }
+            AppEvent::Downloaded { id, outcome } if !self.shows(&id) => {
+                self.running = self.running.saturating_sub(1);
+                if let Download::Ready(path) = outcome {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.prefetch();
             }
             AppEvent::Downloaded { id, outcome } => {
                 self.running = self.running.saturating_sub(1);
@@ -676,6 +789,93 @@ impl App {
         if ok && self.ramping() {
             self.fetch_more();
         }
+    }
+
+    /// For You's batch ended while a category is shown: the browser is free,
+    /// and the guest goes on; the videos are dropped.
+    fn put_batch_aside(&mut self, batch: Result<Batch, String>) {
+        self.fetching = false;
+        if let Ok(batch) = batch
+            && !batch.cookies.is_empty()
+        {
+            self.cookies = batch.cookies;
+        }
+    }
+
+    /// A page of `category` came, or didn't. Its guest goes on to the next
+    /// page; its videos are added if `category` is the one shown.
+    fn on_explored(&mut self, category: Category, page: Result<explore::Page, String>) {
+        if self.exploring == Some(category) {
+            self.exploring = None;
+        }
+        let page = match page {
+            Ok(page) => {
+                self.explore_guest = Some(page.guest.clone());
+                Ok(page)
+            }
+            Err(e) => {
+                // It was a new guest's try too (`explore::fetch`).
+                self.explore_guest = None;
+                Err(e)
+            }
+        };
+        if self.category != Some(category) {
+            return;
+        }
+        match page {
+            Ok(page) => {
+                let before = self.videos.len();
+                self.add(page.videos);
+                self.feed = FeedState::Explored {
+                    new: self.videos.len() - before,
+                    took: page.took,
+                };
+                self.failed_at = None;
+            }
+            Err(e) => {
+                self.feed = FeedState::Failed(text::one_line(&e, 300));
+                self.failed_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Shows `category` (For You: `None`) in place of the feed shown, from
+    /// its start: the videos of the one before go, with their downloads,
+    /// covers and comments, and what of them was shown counts as watched.
+    /// In the demo only the name changes.
+    fn show(&mut self, category: Option<Category>) {
+        if category == self.category {
+            return;
+        }
+        self.category = category;
+        if self.demo {
+            return;
+        }
+        let shown = self.videos.len().min(self.furthest + 1);
+        let watched = self.videos[..shown].iter().map(|v| v.id.clone());
+        self.watched_before.extend(watched);
+        self.stop_playing();
+        // Downloads under way are deleted as they end (`AppEvent::Downloaded`).
+        for (_, download) in self.downloads.drain() {
+            if let Download::Ready(path) = download {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        self.failures.clear();
+        self.covers.clear();
+        self.comments.clear();
+        self.videos.clear();
+        self.spare.clear();
+        (self.at, self.furthest) = (0, 0);
+        (self.batches, self.batch_from) = (0, 0);
+        self.batch_size = feed::batch_size(0);
+        self.play_error = None;
+        self.failed_at = None;
+        self.feed = match category {
+            Some(_) => FeedState::Exploring,
+            None => first_state(&self.engines),
+        };
+        self.fetch_more();
     }
 
     fn on_player(&mut self, event: PlayerEvent) {
@@ -967,7 +1167,7 @@ impl App {
     /// Fetches the top comments of the video shown and the
     /// `COMMENTS_AHEAD` after it that aren't asked for yet.
     fn want_comments(&mut self) {
-        let (Some(client), Some(tx)) = (self.comment_client.clone(), self.tx.clone()) else {
+        let (Some(client), Some(tx)) = (self.www_client.clone(), self.tx.clone()) else {
             return;
         };
         let end = (self.at + COMMENTS_AHEAD + 1).min(self.videos.len());
@@ -1060,6 +1260,10 @@ impl App {
             self.on_help_key(key);
             return;
         }
+        if self.search.is_some() {
+            self.on_search_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.go(1),
@@ -1072,6 +1276,7 @@ impl App {
             KeyCode::Char('l' | '.') | KeyCode::Right => self.with_player(|p| p.seek(SEEK)),
             KeyCode::Char('f') => self.toggle_fullscreen(),
             KeyCode::Char('?') => self.open_help(),
+            KeyCode::Char('/') => self.open_search(),
             KeyCode::Char('r') => {
                 self.failed_at = None;
                 self.fetch_more();
@@ -1141,6 +1346,73 @@ impl App {
                 let last = theme::names().len() - 1;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
             }
+        }
+    }
+
+    /// `/`: the command line opens, offering For You and every category, the
+    /// cursor on the one shown.
+    fn open_search(&mut self) {
+        let selected = explore::matching("")
+            .iter()
+            .position(|c| *c == self.category)
+            .unwrap_or(0);
+        self.search = Some(Search {
+            selected,
+            ..Search::default()
+        });
+    }
+
+    /// Keys while the command line is open: what's typed narrows what it
+    /// offers, with the cursor on the best match that isn't the feed shown;
+    /// ↓ ↑ (or Tab, Ctrl-n Ctrl-p) move it, Enter shows what's under it,
+    /// Esc closes it; Backspace, Ctrl-w and Ctrl-u rub out as in a
+    /// shell.
+    fn on_search_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shown = self.category;
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let offered = explore::matching(&search.text);
+        let last = offered.len().saturating_sub(1);
+        let typed = search.text.clone();
+        match key.code {
+            KeyCode::Esc => self.search = None,
+            KeyCode::Enter => {
+                if let Some(&category) = offered.get(search.selected) {
+                    self.search = None;
+                    self.show(category);
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => search.selected = (search.selected + 1).min(last),
+            KeyCode::Char('n') if ctrl => search.selected = (search.selected + 1).min(last),
+            KeyCode::Up | KeyCode::BackTab => search.selected = search.selected.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => search.selected = search.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                search.text.pop();
+            }
+            KeyCode::Char('h') if ctrl => {
+                search.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => search.text.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let kept = search.text.trim_end().len();
+                search.text.truncate(kept);
+                let cut = search.text.rfind(' ').map_or(0, |i| i + 1);
+                search.text.truncate(cut);
+            }
+            KeyCode::Char(c)
+                if !ctrl && !text::is_hidden(c) && search.text.chars().count() < MAX_SEARCH =>
+            {
+                search.text.push(c);
+            }
+            _ => {}
+        }
+        if let Some(search) = self.search.as_mut()
+            && search.text != typed
+        {
+            let offered = explore::matching(&search.text);
+            search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
         }
     }
 
@@ -1682,6 +1954,160 @@ pub mod tests {
             assert_eq!(app.volume, volume);
         }
         std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    fn page(ids: &[&str]) -> Result<explore::Page, String> {
+        Ok(explore::Page {
+            videos: ids.iter().map(|id| crate::ui::tests::video(id)).collect(),
+            guest: explore::Guest::made_up("tok"),
+            took: Duration::from_millis(600),
+        })
+    }
+
+    fn ids(app: &App) -> Vec<&str> {
+        app.videos.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    #[test]
+    fn slash_opens_the_bar_and_typing_narrows_it() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        set_playing(&mut app, "1", true);
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.search, Some(Search::default()), "the cursor on For You");
+        // Its box is over the panel: the video plays on beside it.
+        assert_eq!(app.placement(), "");
+        // With no panel (a narrow window) it's over the video: taken away.
+        app.size = (80, 40);
+        assert!(app.offers_cover_video());
+        assert_eq!(app.placement(), pepper::remove("t0k"));
+        // Typing puts the cursor on the best match but For You, shown.
+        for c in "fo".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.search.as_ref().unwrap().selected, 1, "Food");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        // While it's open, keys are typed: j doesn't move, q doesn't quit.
+        for c in "jq".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!((app.at, app.quit), (0, false));
+        assert_eq!(app.search.as_ref().unwrap().text, "jq");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "com".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Char('\u{1b}'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(
+            (search.text.as_str(), search.selected),
+            ("com", 1),
+            "Comedy, Anime & Comics"
+        );
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.search.as_ref().unwrap().selected, 0);
+        // Esc closes it and nothing changes; the picture comes back.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.search.is_none() && !app.quit);
+        assert_eq!((app.category, app.videos.len()), (None, 2));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+    }
+
+    #[test]
+    fn a_category_picked_takes_the_place_of_for_you_from_its_start() {
+        let mut app = app_with(["1", "2", "3"].map(crate::ui::tests::video).to_vec());
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/test-explore-{}.mp4", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        app.downloads
+            .insert(VideoId::new("1").unwrap(), Download::Ready(file.clone()));
+        app.go(1);
+        set_playing(&mut app, "2", false);
+        for key in [
+            KeyCode::Char('/'),
+            KeyCode::Char('c'),
+            KeyCode::Char('o'),
+            KeyCode::Char('m'),
+        ] {
+            press(&mut app, key);
+        }
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search.is_none());
+        assert_eq!(app.feed_name(), "Anime & Comics");
+        assert_eq!(app.feed, FeedState::Exploring);
+        assert!(app.videos.is_empty() && app.at == 0 && app.downloads.is_empty());
+        assert!(!file.exists(), "the old feed's downloads go");
+        assert!(app.loaded.is_none() && !app.shows_picture());
+        // What was shown counts as watched: 1 and 2, not 3.
+        let watched: Vec<String> = app
+            .carry_out()
+            .watched
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(watched, ["1", "2"]);
+        // For You's videos are dropped while a category is shown; its
+        // batch's guest goes on.
+        app.fetching = true;
+        app.on_app_event(AppEvent::Found(vec![crate::ui::tests::video("4")]));
+        app.on_app_event(AppEvent::Batch(Ok(batch(&["4"], &[]))));
+        assert!(app.videos.is_empty() && !app.fetching);
+        assert_eq!(app.cookies.len(), 1);
+        // A page of another category is dropped, but its guest is kept; the
+        // category's own is added, less what was seen.
+        let comedy = explore::CATEGORIES[2];
+        app.on_app_event(AppEvent::Explored {
+            category: comedy,
+            page: page(&["5"]),
+        });
+        assert!(app.videos.is_empty() && app.explore_guest.is_some());
+        let anime = explore::CATEGORIES[4];
+        app.on_app_event(AppEvent::Explored {
+            category: anime,
+            page: page(&["6", "7", "1"]),
+        });
+        assert_eq!(ids(&app), ["6", "7"]);
+        assert_eq!(
+            app.feed,
+            FeedState::Explored {
+                new: 2,
+                took: Duration::from_millis(600)
+            }
+        );
+        // A late download of the old feed is deleted, not kept.
+        std::fs::write(&file, b"x").unwrap();
+        app.running = 1;
+        app.on_app_event(AppEvent::Downloaded {
+            id: VideoId::new("3").unwrap(),
+            outcome: Download::Ready(file.clone()),
+        });
+        assert!(!file.exists() && app.running == 0);
+        assert!(!app.downloads.contains_key(&VideoId::new("3").unwrap()));
+        // A page that fails says so; the guest goes.
+        app.on_app_event(AppEvent::Explored {
+            category: anime,
+            page: Err("TikTok sent nothing".into()),
+        });
+        assert_eq!(app.feed, FeedState::Failed("TikTok sent nothing".into()));
+        assert!(app.explore_guest.is_none() && app.videos.len() == 2);
+        // `/` again: the cursor on the category shown. For You comes back
+        // from its start.
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.search.as_ref().unwrap().selected, 1 + 4);
+        for c in "for".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.category, app.feed.clone()),
+            (None, FeedState::NoBrowser)
+        );
+        assert!(app.videos.is_empty());
+        app.on_app_event(AppEvent::Found(vec![crate::ui::tests::video("8")]));
+        assert_eq!(ids(&app), ["8"]);
     }
 
     #[test]

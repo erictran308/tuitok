@@ -3,18 +3,24 @@
 //! caption, sound, counts, where it's at and top comments, then the keys and
 //! the feed's state on the bottom line. Until a video plays in Pepper's box,
 //! the box shows its cover, with under it what plays and how it's going.
-//! `?` opens a popup over it all: every key, and the settings.
+//! `/` opens a command line on the bottom line, as tuitube's `:`, with For
+//! You and Explore's categories in a box over it; `?` a popup over it all:
+//! every key, and the settings.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 
-use crate::app::{App, FeedState, HelpMenu, HelpTab};
+use crate::app::{App, FeedState, HelpMenu, HelpTab, Search};
 use crate::cache::Download;
 use crate::comments::Comments;
 use crate::covers::Cover;
+use crate::explore;
 use crate::pepper;
 use crate::theme;
 use crate::video::{Video, VideoId};
@@ -36,6 +42,14 @@ fn behind(name: &str) -> String {
 
 /// Rows of text under the cover in the box.
 const TEXT_ROWS: u16 = 3;
+
+/// Around the video in its side's box: the border, and a blank cell inside
+/// it, so the video doesn't touch the border or the title in it.
+const GAP: Margin = Margin::new(2, 2);
+
+/// The most categories `/` shows at once (tuitube's `MAX_COMPLETIONS`); the
+/// rest scroll.
+const MAX_OFFERS: usize = 12;
 
 /// Where things go in a window: the box around the video's side (as
 /// tuitube's watch page has one), the video's box in it, the panel beside it
@@ -70,7 +84,7 @@ pub fn areas(area: Rect, cell: (u16, u16), fullscreen: bool) -> Areas {
     };
     Areas {
         stage: Some(stage),
-        video: pepper::portrait_area(stage.inner(Margin::new(1, 1)), cell),
+        video: pepper::portrait_area(stage.inner(GAP), cell),
         panel,
         bottom,
     }
@@ -95,7 +109,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let title = Line::from(vec![
             Span::raw(" "),
             Span::from("▶").fg(c.accent),
-            Span::from(" For You ").fg(c.text).bold(),
+            Span::from(format!(" {} ", app.feed_name()))
+                .fg(c.text)
+                .bold(),
         ]);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -108,7 +124,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(panel) = areas.panel {
         draw_panel(frame, app, panel);
     }
-    draw_bottom(frame, app, areas.bottom);
+    match &app.search {
+        // `/`: the command line takes the bottom line, its categories over it.
+        Some(search) => {
+            command_line(frame, app, search, areas.bottom);
+            draw_offers(frame, app, search, areas.bottom, areas.panel);
+        }
+        None => draw_bottom(frame, app, areas.bottom),
+    }
     if let Some(menu) = &app.help {
         draw_help(frame, app, menu, area);
     }
@@ -157,8 +180,9 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {
             let why = match app.feed {
-                FeedState::Fetching(_) => "Fetching the feed…",
-                _ => "No videos yet",
+                FeedState::Fetching(_) => "Fetching the feed…".to_owned(),
+                FeedState::Exploring => format!("Fetching {}…", app.feed_name()),
+                _ => "No videos yet".to_owned(),
             };
             vec![Line::from(why).fg(c.dim)]
         }
@@ -171,8 +195,9 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
         _ => None,
     });
     // Sixel and iTerm2 pictures paint over what's drawn on them later: none
-    // under the popup (as in tuitube).
-    let cover = cover.filter(|_| app.help.is_none() || !app.pictures_paint_over());
+    // under the popup or the categories' box (as in tuitube).
+    let covered = app.help.is_some() || app.offers_cover_video();
+    let cover = cover.filter(|_| !covered || !app.pictures_paint_over());
     let picture = cover_area(area, app.demo);
     match cover {
         Some(encoded) if encoded.size == (picture.width, picture.height) && picture.height > 0 => {
@@ -322,10 +347,159 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The command line `/` opens on the bottom line, as tuitube's `:` (vim's):
+/// `/` and what's typed, then its keys on the right, or that nothing
+/// matches.
+fn command_line(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
+    let c = &app.colors;
+    let width = usize::from(area.width);
+    let mut right = Vec::new();
+    if explore::matching(&search.text).is_empty() {
+        right.push(Span::from("No category matches ").fg(c.dim));
+    } else {
+        for (n, (key, what)) in [("↑↓", "move"), ("Enter", "show"), ("Esc", "close")]
+            .into_iter()
+            .enumerate()
+        {
+            right.push(Span::from(if n == 0 { " " } else { " · " }).fg(c.dim));
+            right.push(Span::from(key).fg(c.accent));
+            right.push(Span::from(format!(" {what}")).fg(c.dim));
+        }
+        right.push(Span::raw(" "));
+    }
+    let mut right_width: usize = right.iter().map(Span::width).sum();
+    if right_width > width / 2 {
+        right.clear();
+        right_width = 0;
+    }
+    let typed = tail(&search.text, width.saturating_sub(right_width + 2));
+    let used = 2 + Span::raw(typed.to_owned()).width();
+    let mut spans = vec![
+        Span::from("/").fg(c.accent).bold(),
+        Span::from(typed.to_owned()).fg(c.text),
+        Span::from("▏").fg(c.accent),
+        Span::raw(" ".repeat(width.saturating_sub(used + right_width))),
+    ];
+    spans.extend(right);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(c.bg)),
+        area,
+    );
+}
+
+/// The end of `text` that fits in `width` columns.
+fn tail(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (at, c) in text.char_indices().rev() {
+        used += Span::raw(c.encode_utf8(&mut [0; 4]).to_owned()).width();
+        if used > width {
+            return &text[at + c.len_utf8()..];
+        }
+    }
+    text
+}
+
+/// What `/` offers, as tuitube's command line shows what completes it: in a
+/// box over the command line (`bottom`), For You and the categories that
+/// match what's typed, the feed shown marked, the cursor's row lit, and a
+/// scrollbar when they don't all fit; no box when none match. The box goes
+/// over the `panel`, as wide and on its bottom edge, so the video plays on
+/// beside it; with no panel, over the video's side.
+fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, panel: Option<Rect>) {
+    const TITLE: &str = " Categories ";
+    let c = &app.colors;
+    let offered = explore::matching(&search.text);
+    // Room over the command line, less the box's borders.
+    let rows = offered
+        .len()
+        .min(MAX_OFFERS)
+        .min(usize::from(bottom.y).saturating_sub(2));
+    if rows == 0 {
+        return;
+    }
+    // As wide as the longest of all, so it keeps its width as it narrows;
+    // names are ASCII: bytes are cells.
+    let names = explore::matching("")
+        .iter()
+        .map(|offer| explore::name(*offer).len())
+        .max()
+        .unwrap_or(0);
+    // The border, the bar, the mark, the name, a space and the border.
+    let fits = (names + 6).max(TITLE.len() + 4) as u16;
+    let (x, width) = match panel {
+        Some(panel) => (panel.x, panel.width),
+        None => (bottom.x, fits.min(bottom.width)),
+    };
+    let height = rows as u16 + 2;
+    let popup = Rect::new(x, bottom.y - height, width, height);
+    // As little scrolled as keeps the cursor in view.
+    let lit = search.selected;
+    let mut scroll = search.scroll.get().min(lit);
+    if lit >= scroll + rows {
+        scroll = lit + 1 - rows;
+    }
+    search.scroll.set(scroll);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(c.accent))
+        .title(Span::from(TITLE).fg(c.text).bold())
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = offered
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(rows)
+        .map(|(n, offer)| {
+            let chosen = n == lit;
+            let name = explore::name(*offer);
+            let row = Line::from(vec![
+                if chosen {
+                    Span::from("▌").fg(c.accent)
+                } else {
+                    Span::raw(" ")
+                },
+                if *offer == app.category {
+                    Span::from("● ").fg(c.accent)
+                } else {
+                    Span::raw("  ")
+                },
+                Span::from(name).fg(c.text).bold(),
+                // To the box's edge, so the cursor's row is lit across.
+                Span::raw(" ".repeat(usize::from(inner.width).saturating_sub(3 + name.len()))),
+            ]);
+            if chosen {
+                row.style(Style::new().bg(c.selected))
+            } else {
+                row
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    let hidden = offered.len() - rows;
+    if hidden > 0 {
+        let mut state = ScrollbarState::new(hidden).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .style(Style::new().fg(c.dim)),
+            popup.inner(Margin::new(0, 1)),
+            &mut state,
+        );
+    }
+}
+
 /// Every key, for the `?` popup's first tab.
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 10] = [
     ("j  ↓", "the next video"),
     ("k  ↑", "the one before"),
+    (
+        "/",
+        "For You, or one of Explore's categories: type, ↑ ↓, Enter",
+    ),
     ("Space", "pause or play"),
     ("h l  ← →  , .", "back or on 5 s"),
     (
@@ -489,18 +663,19 @@ fn hints(app: &App, width: u16) -> Line<'static> {
     let c = &app.colors;
     let keys = [
         ("j k", "next/back"),
+        ("/", "category"),
         ("space", "pause"),
         ("m", "mute"),
+        ("?", "help"),
         ("- +", "volume"),
         ("f", "fill"),
-        ("?", "help"),
         ("r", "more"),
         ("q", "quit"),
     ];
     // The last (how to quit) is always there; the others fit in before it.
-    // All ASCII: bytes are cells.
     let (last, rest) = keys.split_last().expect("there are hints");
-    let wide = |(keys, what): &(&str, &str)| 2 + keys.len() + 1 + what.len();
+    let cells = |s: &str| Span::raw(s.to_owned()).width();
+    let wide = |(keys, what): &(&str, &str)| 2 + cells(keys) + 1 + cells(what);
     // The first one's gap is one space, not two.
     let mut room = (usize::from(width) + 1).saturating_sub(wide(last));
     let mut shown = Vec::new();
@@ -555,6 +730,13 @@ fn status(app: &App) -> Line<'static> {
             }
             Line::from(said).fg(c.dim)
         }
+        FeedState::Exploring => Line::from(format!("Fetching {}…", app.feed_name())).fg(c.dim),
+        FeedState::Explored { new, took } => Line::from(format!(
+            "{new} new videos · {} · {:.0} s",
+            app.feed_name(),
+            took.as_secs_f64()
+        ))
+        .fg(c.dim),
         FeedState::Failed(e) => {
             Line::from(format!("The feed failed: {e} (r tries again)")).fg(c.red)
         }
@@ -652,13 +834,155 @@ pub mod tests {
         let last = text.lines().last().unwrap();
         // The status is long: the hints that don't fit are left out, but
         // not how to quit.
-        assert!(last.starts_with(" j k next/back  space pause  m mute  - + volume  q quit"));
+        assert!(last.starts_with(" j k next/back  / category  space pause  m mute  q quit"));
         assert!(last.contains("No browser for the feed"));
         app.feed = FeedState::Failed("x".into());
         let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
         assert!(last.starts_with(
-            " j k next/back  space pause  m mute  - + volume  f fill  ? help  r more  q quit"
+            " j k next/back  / category  space pause  m mute  ? help  - + volume  f fill  q quit"
         ));
+    }
+
+    #[test]
+    fn slash_opens_a_command_line_with_the_categories_over_it() {
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        let line = |text: &str, shown: &str| {
+            text.lines()
+                .find(|line| line.contains(shown))
+                .unwrap_or_else(|| panic!("{shown}\n{text}"))
+                .to_owned()
+        };
+        // Closed: the feed's name is the title, and `/` is among the keys.
+        let text = screen(&app, 120, 40);
+        assert!(text.lines().next().unwrap().starts_with("╭ ▶ For You ──"));
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .starts_with(" j k next/back  / category  ")
+        );
+        // Open: the command line takes the bottom line, as tuitube's `:`, and
+        // over it, on the panel's bottom edge and as wide, a box of what
+        // matches, the feed shown marked and the cursor's row lit across.
+        app.search = Some(Search {
+            text: "fo".into(),
+            selected: 1,
+            ..Search::default()
+        });
+        let text = screen(&app, 120, 40);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[39].starts_with("/fo▏ "), "{}", rows[39]);
+        assert!(
+            rows[39].ends_with(" ↑↓ move · Enter show · Esc close "),
+            "{}",
+            rows[39]
+        );
+        // The panel starts at column 72 of 120.
+        let panel = |row: &str| row.chars().skip(72).collect::<String>();
+        let top = panel(rows[35]);
+        assert!(
+            top.starts_with("╭ Categories ─") && top.ends_with("─╮"),
+            "{top}"
+        );
+        assert!(panel(rows[36]).starts_with("│ ● For You "), "{}", rows[36]);
+        assert!(panel(rows[37]).starts_with("│▌  Food "), "{}", rows[37]);
+        assert!(panel(rows[38]).starts_with("╰─"), "{}", rows[38]);
+        assert_eq!(bg_of(&app, (120, 40), "Food", 0), app.colors.selected);
+        assert_eq!(bg_of(&app, (120, 40), "Food", 42), app.colors.selected);
+        assert!(!text.contains("Comedy"));
+        // The video's side isn't covered.
+        assert!(
+            !rows[36]
+                .chars()
+                .take(72)
+                .collect::<String>()
+                .contains("For You")
+        );
+        // A narrow window has no panel: the box is over the video's side,
+        // as wide as the longest name needs.
+        let narrow = screen(&app, 80, 40);
+        let rows: Vec<&str> = narrow.lines().collect();
+        assert!(
+            rows[35].starts_with("╭ Categories ─────────╮"),
+            "{}",
+            rows[35]
+        );
+        assert!(rows[37].starts_with("│▌  Food "), "{}", rows[37]);
+        // Nothing matches: no box, and the command line says so.
+        app.search = Some(Search {
+            text: "zzz".into(),
+            ..Search::default()
+        });
+        let text = screen(&app, 120, 40);
+        assert!(!text.contains("Categories"));
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("No category matches ")
+        );
+        // Everything: 12 rows at most, scrolled to keep the cursor in view,
+        // with a scrollbar; the scroll stays while the cursor moves in view.
+        app.search = Some(Search {
+            selected: 21,
+            ..Search::default()
+        });
+        let text = screen(&app, 120, 40);
+        let technology = line(&text, "Technology");
+        assert!(technology.contains("│▌  Technology") && technology.contains('█'));
+        assert!(!text.contains("● For You") && !text.contains("Daily Life"));
+        app.search.as_mut().unwrap().selected = 15;
+        let text = screen(&app, 120, 40);
+        assert_eq!(app.search.as_ref().unwrap().scroll.get(), 10);
+        assert!(line(&text, " Food").contains("│▌  Food"));
+        assert!(text.contains("Beauty Care") && !text.contains("Daily Life"));
+        // A category shown: its name is the title, and the status says so.
+        app.search = None;
+        app.category = Some(explore::CATEGORIES[2]);
+        app.feed = FeedState::Explored {
+            new: 15,
+            took: std::time::Duration::from_millis(600),
+        };
+        let text = screen(&app, 120, 40);
+        assert!(text.lines().next().unwrap().starts_with("╭ ▶ Comedy ──"));
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("15 new videos · Comedy · 1 s")
+        );
+        app.feed = FeedState::Exploring;
+        app.videos.clear();
+        assert!(screen(&app, 120, 40).contains("Fetching Comedy…"));
+        // With f, the same.
+        app.fullscreen = true;
+        app.search = Some(Search::default());
+        assert!(
+            screen(&app, 120, 40)
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("/▏ ")
+        );
+    }
+
+    /// The background `dx` cells after where `shown` starts on screen.
+    fn bg_of(app: &App, (width, height): (u16, u16), shown: &str, dx: u16) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            let (mut row, mut starts) = (String::new(), Vec::new());
+            for x in 0..width {
+                starts.push(row.len());
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(at) = row.find(shown) {
+                let x = starts.iter().position(|start| *start == at).unwrap() as u16;
+                return buffer[(x + dx, y)].bg;
+            }
+        }
+        panic!("{shown} isn't shown");
     }
 
     #[test]
@@ -780,12 +1104,11 @@ pub mod tests {
         // video in it, under its title.
         let laid = areas(Rect::new(0, 0, 120, 40), app.cell, false);
         let stage = laid.stage.unwrap();
-        assert!(
-            stage
-                .inner(Margin::new(1, 1))
-                .contains(laid.video.as_position())
-        );
-        assert!(laid.video.right() < stage.right() && laid.video.bottom() < stage.bottom());
+        assert!(stage.inner(GAP).contains(laid.video.as_position()));
+        // A blank row between the video and the bar in the top border, and
+        // one under it.
+        assert!(laid.video.y >= stage.y + 2);
+        assert!(laid.video.right() < stage.right() - 1 && laid.video.bottom() < stage.bottom() - 1);
         assert!(text.contains("╭ ▶ For You ─"));
         // f: the box takes all but the bottom line, and the panel goes.
         let filled = areas(Rect::new(0, 0, 120, 40), app.cell, true);

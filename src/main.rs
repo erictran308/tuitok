@@ -10,6 +10,7 @@ mod comments;
 mod config;
 mod covers;
 mod demo;
+mod explore;
 mod feed;
 mod guest;
 mod pepper;

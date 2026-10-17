@@ -236,6 +236,12 @@ pub fn video_url_allowed(url: &str) -> bool {
     https_host(url).is_some_and(|host| host.ends_with(".tiktok.com") && host != "www.tiktok.com")
 }
 
+/// An address of TikTok's own pages tuitok fetches (top comments, Explore's
+/// categories): https on www.tiktok.com.
+pub fn www_url_allowed(url: &str) -> bool {
+    https_host(url) == Some("www.tiktok.com")
+}
+
 /// A picture address tuitok fetches: https on TikTok's image hosts.
 pub fn image_url_allowed(url: &str) -> bool {
     https_host(url).is_some_and(|host| {

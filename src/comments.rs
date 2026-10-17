@@ -48,11 +48,6 @@ pub fn url(id: &VideoId) -> String {
     )
 }
 
-/// Whether `url` may be followed to for comments: https on www.tiktok.com.
-pub fn url_allowed(url: &str) -> bool {
-    video::https_host(url) == Some("www.tiktok.com")
-}
-
 /// Video `id`'s top comments, off the event loop.
 pub async fn fetch(client: &reqwest::Client, id: &VideoId) -> Result<Vec<Comment>> {
     let mut response = client
@@ -116,10 +111,14 @@ mod tests {
             url(&id),
             "https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id=7658861391901740308&count=10&cursor=0"
         );
-        assert!(url_allowed(&url(&id)));
-        assert!(!url_allowed("http://www.tiktok.com/api/comment/list/"));
-        assert!(!url_allowed("https://www.tiktok.com.evil.com/"));
-        assert!(!url_allowed("https://v16-webapp-prime.tiktok.com/x"));
+        assert!(video::www_url_allowed(&url(&id)));
+        assert!(!video::www_url_allowed(
+            "http://www.tiktok.com/api/comment/list/"
+        ));
+        assert!(!video::www_url_allowed("https://www.tiktok.com.evil.com/"));
+        assert!(!video::www_url_allowed(
+            "https://v16-webapp-prime.tiktok.com/x"
+        ));
     }
 
     #[test]
@@ -170,7 +169,7 @@ mod tests {
         let batch = crate::feed::fetch(engine, &program, &place.join("chrome"), &ask, &|_| {})
             .await
             .unwrap();
-        let client = cache::client(url_allowed);
+        let client = cache::client(video::www_url_allowed);
         let mut found = 0;
         for video in &batch.videos {
             found += fetch(&client, &video.id).await.unwrap().len();
