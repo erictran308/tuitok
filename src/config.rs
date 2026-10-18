@@ -184,6 +184,34 @@ pub fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("cannot protect {}", shown(dir)))
 }
 
+/// Writes `bytes` to `target` whole: to a new file readable only by you,
+/// this process's own (`<target>.<pid>.part`, so two tuitoks writing at
+/// once don't touch each other's), then renamed into place, so a crash
+/// halfway leaves the old one. Nothing half-written is left about.
+pub fn write_private(target: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut part = target.as_os_str().to_owned();
+    part.push(format!(".{}.part", std::process::id()));
+    let part = PathBuf::from(part);
+    let _ = std::fs::remove_file(&part);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&part)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&part, target));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("cannot write {}", shown(target)));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

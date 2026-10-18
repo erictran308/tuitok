@@ -108,7 +108,7 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<DynamicImage> 
     if !image_url_allowed(url) {
         bail!("not one of TikTok's pictures");
     }
-    let mut response = client
+    let response = client
         .get(url)
         .header(reqwest::header::USER_AGENT, cache::USER_AGENT)
         .header(reqwest::header::REFERER, cache::REFERER)
@@ -117,13 +117,7 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<DynamicImage> 
     if response.status() != reqwest::StatusCode::OK {
         bail!("HTTP {}", response.status().as_u16());
     }
-    let mut data = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if data.len() + chunk.len() > MAX_BYTES {
-            bail!("the picture is too big");
-        }
-        data.extend_from_slice(&chunk);
-    }
+    let data = cache::read_capped(response, MAX_BYTES, "the picture").await?;
     tokio::task::spawn_blocking(move || contained(|| decode(&data))).await?
 }
 

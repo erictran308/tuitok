@@ -201,7 +201,7 @@ fn set_cookie(header: &str, name: &str) -> Option<String> {
 
 /// The videos of a page of `category`, each with `guest`'s token.
 async fn page(client: &reqwest::Client, category: Category, guest: &Guest) -> Result<Vec<Video>> {
-    let mut response = client
+    let response = client
         .get(url(category))
         .header(USER_AGENT, cache::USER_AGENT)
         .header(REFERER, PAGE)
@@ -212,13 +212,7 @@ async fn page(client: &reqwest::Client, category: Category, guest: &Guest) -> Re
     if response.status() != reqwest::StatusCode::OK {
         bail!("HTTP {}", response.status().as_u16());
     }
-    let mut data = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if data.len() + chunk.len() > MAX_BYTES {
-            bail!("the answer is too big");
-        }
-        data.extend_from_slice(&chunk);
-    }
+    let data = cache::read_capped(response, MAX_BYTES, "the answer").await?;
     if data.is_empty() {
         bail!("TikTok sent nothing");
     }

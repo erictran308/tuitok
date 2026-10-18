@@ -8,7 +8,6 @@
 //! they came (`feed::guest_cookies`), expired ones dropped, the ids checked
 //! as ids, the file's size capped.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,28 +73,15 @@ fn parse(json: &Value, now: f64) -> Guest {
     Guest { cookies, watched }
 }
 
-/// Keeps `guest` for the next run: written to a new file readable only by
-/// you, then put in place whole, so a crash halfway leaves the old one.
+/// Keeps `guest` for the next run, written whole
+/// (`config::write_private`), so a crash halfway leaves the old one.
 pub fn save(data: &Path, guest: &Guest) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let target = path(data);
-    let part = data.join(format!("{FILE}.part"));
-    let _ = std::fs::remove_file(&part);
     let newest = &guest.watched[guest.watched.len().saturating_sub(MAX_WATCHED)..];
     let json = json!({
         "cookies": guest.cookies,
         "watched": newest.iter().map(VideoId::as_str).collect::<Vec<_>>(),
     });
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&part)
-        .with_context(|| format!("cannot write {}", shown(&part)))?;
-    file.write_all(json.to_string().as_bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("cannot write {}", shown(&part)))?;
-    std::fs::rename(&part, &target).with_context(|| format!("cannot write {}", shown(&target)))
+    crate::config::write_private(&path(data), json.to_string().as_bytes())
 }
 
 /// `tuitok --forget`: deletes the guest; whether there was one.
@@ -164,7 +150,7 @@ mod tests {
         // Saved again over it, and nothing half-written left about.
         save(&data, &Guest::default()).unwrap();
         assert_eq!(load(&data), Guest::default());
-        assert!(!data.join("guest.json.part").exists());
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
         assert!(forget(&data).unwrap());
         assert!(!forget(&data).unwrap());
         // A link in its place isn't followed.

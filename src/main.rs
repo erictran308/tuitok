@@ -25,6 +25,7 @@ mod video;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use browser::Engine;
 
@@ -42,15 +43,20 @@ Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --forget | --he
   --help      print this
   --version   print tuitok's version
 
-Keys: j or ↓ the next video, k or ↑ the one before, space pause, m mute,
-- and + the volume down and up, h, ← or , and l, → or . back and on 5 s,
-f fill the tab, ? every key and the settings (the theme), r fetch more, q quit.
+Keys: j or ↓ the next video, k or ↑ the one before, / For You or one of
+Explore's categories, space pause, m mute, - and + the volume down and up,
+h, ← or , and l, → or . back and on 5 s, f fill the tab, ? every key and
+the settings (the theme), r fetch more, q quit.
 
 tuitok isn't made or endorsed by TikTok or ByteDance.";
 
 /// The box `--feed` picks renditions for, in pixels: about an upright box
 /// in a laptop's Pepper window.
 const LIST_BOX: (u32, u32) = (608, 1080);
+
+/// Why one of tuitok's tasks panicked, once one has: tuitok then quits as
+/// with q, and says it once the terminal is back ([`start_screen`]).
+static TASK_PANIC: OnceLock<String> = OnceLock::new();
 
 fn main() -> ExitCode {
     // Before any thread starts: code tuitok uses starts programs by name
@@ -105,6 +111,18 @@ fn fail(e: &anyhow::Error) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// How a run ended: its error, else a task's panic, else well.
+fn ended(result: std::io::Result<()>) -> ExitCode {
+    match (result, TASK_PANIC.get()) {
+        (Err(e), _) => fail(&e.into()),
+        (Ok(()), Some(why)) => {
+            eprintln!("tuitok: a bug ended it: {why}");
+            ExitCode::FAILURE
+        }
+        (Ok(()), None) => ExitCode::SUCCESS,
+    }
+}
+
 fn run() -> ExitCode {
     let session = match config::Session::start() {
         Ok(session) => session,
@@ -149,10 +167,7 @@ fn run() -> ExitCode {
         );
     }
     session.end();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(&e.into()),
-    }
+    ended(result)
 }
 
 /// `--demo`: the real screen with made-up videos; nothing is fetched,
@@ -172,26 +187,35 @@ fn run_demo() -> ExitCode {
     let result = runtime.block_on(app.run(&mut terminal));
     ratatui::restore();
     tmux::restore();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(&e.into()),
-    }
+    ended(result)
 }
 
 /// Once the terminal is set up and before keys are read: how it draws
-/// pictures (`covers::picker` asks it), and a panic hook that lets a
-/// picture decoder's caught panic pass without tearing the screen down
-/// (ratatui's hook, set by `ratatui::init`, restores the terminal).
+/// pictures (`covers::picker` asks it), and a panic hook. A picture
+/// decoder's caught panic passes without tearing the screen down. Another
+/// task's would leave tuitok drawing on a terminal put back to normal
+/// (tokio catches it and the event loop goes on), so the screen stays and
+/// tuitok quits as with q (SIGTERM, which `App::run` takes so): the player
+/// quits, Pepper's box goes, and why is said after ([`ended`]). Only the
+/// event loop's own (on the main thread) restores the terminal at once
+/// (ratatui's hook, set by `ratatui::init`).
 fn start_screen(app: &mut app::App) {
     tmux::save();
     app.set_picker(covers::picker());
     app.behind_multiplexer = pepper::behind_multiplexer();
     let restore = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if !covers::panic_is_contained() {
-            tmux::restore();
-            restore(info);
+        if covers::panic_is_contained() {
+            return;
         }
+        if std::thread::current().name() != Some("main") {
+            let _ = TASK_PANIC.set(text::one_line(&info.to_string(), 400));
+            // SAFETY: a plain signal to tuitok itself.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+            return;
+        }
+        tmux::restore();
+        restore(info);
     }));
 }
 

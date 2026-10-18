@@ -96,19 +96,43 @@ pub fn client(allowed: fn(&str) -> bool) -> reqwest::Client {
         .expect("the TLS backend is built in")
 }
 
-/// The file a rendition is kept in, named from its checked id, codec and
-/// size only.
-pub fn file_name(id: &VideoId, rendition: &Rendition) -> String {
+/// The file a rendition is kept in, named from its checked id, the
+/// download's number in the run, its codec and size only: a download
+/// stopped half way never shares a file with the next one of that video.
+pub fn file_name(id: &VideoId, number: u64, rendition: &Rendition) -> String {
     let codec = match rendition.codec {
         Codec::H264 => "h264",
         Codec::H265 => "h265",
     };
     format!(
-        "{}-{codec}-{}x{}.mp4",
+        "{}-{number}-{codec}-{}x{}.mp4",
         id.as_str(),
         rendition.width,
         rendition.height
     )
+}
+
+/// A body read whole, up to `max` bytes; `what` says what it is if it's
+/// bigger (said first by its `Content-Length`, else found while reading).
+pub async fn read_capped(
+    mut response: reqwest::Response,
+    max: usize,
+    what: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > max as u64)
+    {
+        bail!("{what} is too big");
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if data.len() + chunk.len() > max {
+            bail!("{what} is too big");
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 /// Downloads `job`, trying its addresses in turn; `progress` hears how far
@@ -164,14 +188,19 @@ async fn get(
     if of.is_some_and(|bytes| bytes > DOWNLOAD_UP_TO) {
         return Err(TooBig.into());
     }
-    let part = job.path.with_extension("part");
-    let _ = tokio::fs::remove_file(&part).await;
-    match write(&mut response, &part, of, progress).await {
-        Ok(()) => Ok(tokio::fs::rename(&part, &job.path).await?),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&part).await;
-            Err(e)
-        }
+    let part = Part(job.path.with_extension("part"));
+    write(&mut response, &part.0, of, progress).await?;
+    Ok(tokio::fs::rename(&part.0, &job.path).await?)
+}
+
+/// A download's `.part` file, deleted when the download ends however it
+/// ends: renamed into place (nothing's left to delete), failed, or stopped
+/// half way (`App` stops a download no longer wanted, which drops it).
+struct Part(PathBuf);
+
+impl Drop for Part {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -247,8 +276,8 @@ mod tests {
             urls: Vec::new(),
         };
         assert_eq!(
-            file_name(&id, &rendition),
-            "7658861391901740308-h265-576x1024.mp4"
+            file_name(&id, 3, &rendition),
+            "7658861391901740308-3-h265-576x1024.mp4"
         );
         assert!(is_mp4(b"\0\0\0\x20ftypisom\0\0\x02\0"));
         assert!(!is_mp4(b"<html><head>"));
@@ -288,10 +317,10 @@ mod tests {
             .await
             .unwrap();
         let client = client(video_url_allowed);
-        for video in batch.videos.iter().take(2) {
+        for (number, video) in (1..).zip(batch.videos.iter().take(2)) {
             let rendition = video.best((608, 1080)).unwrap().clone();
             let job = Job {
-                path: place.join(file_name(&video.id, &rendition)),
+                path: place.join(file_name(&video.id, number, &rendition)),
                 id: video.id.clone(),
                 rendition,
                 token: video.token.clone(),

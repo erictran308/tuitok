@@ -167,6 +167,8 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
             }
             lines.push(if let Some(e) = &app.play_error {
                 Line::from(e.clone()).fg(c.red)
+            } else if app.player_gone {
+                Line::from("The player closed: j or k plays on").fg(c.dim)
             } else if app.loading() {
                 Line::from("Loading…").fg(c.dim)
             } else if app.shows_picture() {
@@ -1059,6 +1061,10 @@ pub mod tests {
         app.playing = None;
         app.play_error = Some("It can't play: loading failed".into());
         assert!(screen(&app, 120, 40).contains("It can't play: loading failed"));
+        // Its window closed: none opens again until a key asks.
+        app.play_error = None;
+        app.player_gone = true;
+        assert!(screen(&app, 120, 40).contains("The player closed: j or k plays on"));
     }
 
     #[test]

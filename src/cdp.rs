@@ -57,13 +57,17 @@ impl Cdp {
         (cdp, outgoing)
     }
 
-    /// A client over the WebSocket at `url`.
+    /// A client over the WebSocket at `url`. The connection waits
+    /// `CALL_WAIT` at most: a browser that takes it and never answers would
+    /// otherwise hold the batch, and every batch after it, for good.
     pub async fn websocket(url: &str) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_MESSAGE));
-        let (socket, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), true)
+        let connect = tokio_tungstenite::connect_async_with_config(url, Some(config), true);
+        let (socket, _) = tokio::time::timeout(CALL_WAIT, connect)
             .await
+            .context("no DevTools WebSocket: no answer")?
             .context("no DevTools WebSocket")?;
         let (mut sink, mut stream) = socket.split();
         let (cdp, mut outgoing) = Self::new();

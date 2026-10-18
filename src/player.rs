@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -53,19 +54,31 @@ pub struct Sound {
     pub muted: bool,
 }
 
+/// What the player says. What it says of a file names the playlist entry
+/// it played it as, so what an older file said (one ending or looping just
+/// as the next was loaded) isn't taken for the next one's.
 #[derive(Debug, PartialEq)]
 pub enum PlayerEvent {
-    /// The first frame of what was loaded is ready.
-    Restarted,
-    Position(f64),
-    Duration(f64),
+    /// It took the load numbered `load` ([`Player::load`]) as playlist
+    /// entry `entry`.
+    Loaded {
+        load: u64,
+        entry: i64,
+    },
+    /// The first frame of entry `entry` is ready (and again after each loop
+    /// or seek).
+    Restarted(i64),
+    /// Where entry `entry` is, in seconds, said as the whole second changes
+    /// (the panel shows no finer), and how long it is.
+    Position(i64, f64),
+    Duration(i64, f64),
     Paused(bool),
     /// The volume, in percent, and the sound off or on: as tuitok set
     /// them, or as they were changed in mpv's window.
     Volume(f64),
     Muted(bool),
-    /// What was loaded can't play.
-    Failed(String),
+    /// Entry `entry` can't play.
+    Failed(i64, String),
     /// The player is gone: its window closed, or it ended.
     Exited,
 }
@@ -97,6 +110,8 @@ pub struct Player {
     out: mpsc::UnboundedSender<String>,
     /// Pepper's token for this player's picture (pepper-play only).
     pub token: Option<String>,
+    /// Loads so far: each is numbered, and its answer names the number.
+    loads: AtomicU64,
     child: Child,
 }
 
@@ -170,14 +185,20 @@ impl Player {
         });
         tokio::spawn(async move {
             let mut lines = BufReader::new(read).lines();
+            let mut heard = Heard::default();
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(event) = parse(&line) {
+                if let Some(event) = heard.parse(&line) {
                     events(event);
                 }
             }
             events(PlayerEvent::Exited);
         });
-        let player = Self { out, token, child };
+        let player = Self {
+            out,
+            token,
+            loads: AtomicU64::new(0),
+            child,
+        };
         // Before the volume is observed, so the first value it says is this.
         player.set_volume(sound.volume);
         player.set_muted(sound.muted);
@@ -201,14 +222,18 @@ impl Player {
 
     /// One command, as JSON (so nothing in it can break out of it).
     fn command(&self, command: Value) {
-        let _ = self
-            .out
-            .send(format!("{}\n", json!({ "command": command })));
+        self.send(json!({ "command": command }));
     }
 
-    /// Plays `target` in place of what plays. A stream's cookie is set just
-    /// before, over the socket; a file clears it.
-    pub fn load(&self, target: &Target) {
+    fn send(&self, message: Value) {
+        let _ = self.out.send(format!("{message}\n"));
+    }
+
+    /// Plays `target` in place of what plays, unpaused (mpv keeps `pause`
+    /// from one file to the next). A stream's cookie is set just before,
+    /// over the socket; a file clears it. Gives the load's number, which
+    /// [`PlayerEvent::Loaded`] names with the playlist entry it made.
+    pub fn load(&self, target: &Target) -> u64 {
         let (what, headers): (String, Vec<String>) = match target {
             Target::File(path) => (path.to_string_lossy().into_owned(), Vec::new()),
             Target::Stream { url, token } => (
@@ -220,7 +245,10 @@ impl Player {
             ),
         };
         self.command(json!(["set_property", "http-header-fields", headers]));
-        self.command(json!(["loadfile", what, "replace"]));
+        self.command(json!(["set_property", "pause", false]));
+        let load = self.loads.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(json!({ "command": ["loadfile", what, "replace"], "request_id": load }));
+        load
     }
 
     /// Stops playing, staying open for the next `load`.
@@ -279,27 +307,64 @@ fn as_fd3(fd: RawFd) -> std::io::Result<()> {
     }
 }
 
-/// What one of mpv's messages means to tuitok, if anything.
-fn parse(line: &str) -> Option<PlayerEvent> {
-    let message: Value = serde_json::from_str(line).ok()?;
-    let number = |value: &Value| value.as_f64().filter(|n| n.is_finite() && *n >= 0.0);
-    match message["event"].as_str()? {
-        "playback-restart" => Some(PlayerEvent::Restarted),
-        "end-file" if message["reason"] == "error" => Some(PlayerEvent::Failed(text::one_line(
-            message["file_error"]
-                .as_str()
-                .unwrap_or("it can't be played"),
-            120,
-        ))),
-        "property-change" => match message["name"].as_str()? {
-            "time-pos" => number(&message["data"]).map(PlayerEvent::Position),
-            "duration" => number(&message["data"]).map(PlayerEvent::Duration),
-            "pause" => message["data"].as_bool().map(PlayerEvent::Paused),
-            "volume" => number(&message["data"]).map(PlayerEvent::Volume),
-            "mute" => message["data"].as_bool().map(PlayerEvent::Muted),
+/// What the player's messages mean, read in order: the playlist entry it
+/// plays (its last `start-file`), which what it says of the file is
+/// about, and the whole second of the last position said.
+#[derive(Default)]
+struct Heard {
+    entry: Option<i64>,
+    second: Option<(i64, u64)>,
+}
+
+impl Heard {
+    /// What one of mpv's messages means to tuitok, if anything. A position
+    /// goes on only when its whole second changes: mpv says one each frame,
+    /// and each is a redraw.
+    fn parse(&mut self, line: &str) -> Option<PlayerEvent> {
+        let message: Value = serde_json::from_str(line).ok()?;
+        let number = |value: &Value| value.as_f64().filter(|n| n.is_finite() && *n >= 0.0);
+        // Only loads carry a number of their own; other commands' answers are 0.
+        if let Some(load) = message["request_id"].as_u64().filter(|&n| n > 0) {
+            let entry = message["data"]["playlist_entry_id"].as_i64()?;
+            return Some(PlayerEvent::Loaded { load, entry });
+        }
+        match message["event"].as_str()? {
+            "start-file" => {
+                self.entry = message["playlist_entry_id"].as_i64();
+                self.second = None;
+                None
+            }
+            "playback-restart" => self.entry.map(PlayerEvent::Restarted),
+            "end-file" if message["reason"] == "error" => Some(PlayerEvent::Failed(
+                message["playlist_entry_id"].as_i64()?,
+                text::one_line(
+                    message["file_error"]
+                        .as_str()
+                        .unwrap_or("it can't be played"),
+                    120,
+                ),
+            )),
+            "property-change" => match message["name"].as_str()? {
+                "time-pos" => {
+                    let (entry, seconds) = (self.entry?, number(&message["data"])?);
+                    let second = Some((entry, seconds as u64));
+                    if second == self.second {
+                        return None;
+                    }
+                    self.second = second;
+                    Some(PlayerEvent::Position(entry, seconds))
+                }
+                "duration" => Some(PlayerEvent::Duration(
+                    self.entry?,
+                    number(&message["data"])?,
+                )),
+                "pause" => message["data"].as_bool().map(PlayerEvent::Paused),
+                "volume" => number(&message["data"]).map(PlayerEvent::Volume),
+                "mute" => message["data"].as_bool().map(PlayerEvent::Muted),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
+        }
     }
 }
 
@@ -309,17 +374,43 @@ mod tests {
 
     #[test]
     fn mpvs_messages() {
+        let mut heard = Heard::default();
+        let mut parse = |line: &str| heard.parse(line);
+        // Nothing of a file is said before one starts.
+        assert_eq!(parse(r#"{"event":"playback-restart"}"#), None);
+        assert_eq!(
+            parse(r#"{"data":{"playlist_entry_id":3},"request_id":2,"error":"success"}"#),
+            Some(PlayerEvent::Loaded { load: 2, entry: 3 })
+        );
+        assert_eq!(parse(r#"{"request_id":0,"error":"success"}"#), None);
+        assert_eq!(
+            parse(r#"{"event":"start-file","playlist_entry_id":3}"#),
+            None
+        );
         assert_eq!(
             parse(r#"{"event":"playback-restart"}"#),
-            Some(PlayerEvent::Restarted)
+            Some(PlayerEvent::Restarted(3))
         );
         assert_eq!(
             parse(r#"{"event":"property-change","id":1,"name":"time-pos","data":3.5}"#),
-            Some(PlayerEvent::Position(3.5))
+            Some(PlayerEvent::Position(3, 3.5))
+        );
+        // The same second again: nothing to redraw.
+        assert_eq!(
+            parse(r#"{"event":"property-change","id":1,"name":"time-pos","data":3.9}"#),
+            None
+        );
+        assert_eq!(
+            parse(r#"{"event":"property-change","id":1,"name":"time-pos","data":4.0}"#),
+            Some(PlayerEvent::Position(3, 4.0))
         );
         assert_eq!(
             parse(r#"{"event":"property-change","name":"time-pos","data":null}"#),
             None
+        );
+        assert_eq!(
+            parse(r#"{"event":"property-change","name":"duration","data":9.0}"#),
+            Some(PlayerEvent::Duration(3, 9.0))
         );
         assert_eq!(
             parse(r#"{"event":"property-change","name":"pause","data":true}"#),
@@ -335,13 +426,18 @@ mod tests {
         );
         assert_eq!(
             parse(
-                r#"{"event":"end-file","reason":"error","file_error":"loading failed\u001b]0;x"}"#
+                r#"{"event":"end-file","reason":"error","playlist_entry_id":3,"file_error":"loading failed\u001b]0;x"}"#
             ),
-            Some(PlayerEvent::Failed("loading failed]0;x".into()))
+            Some(PlayerEvent::Failed(3, "loading failed]0;x".into()))
         );
         assert_eq!(parse(r#"{"event":"end-file","reason":"stop"}"#), None);
-        assert_eq!(parse(r#"{"request_id":0,"error":"success"}"#), None);
         assert_eq!(parse("not json"), None);
+        // The next file starts: its position is said from its first second.
+        parse(r#"{"event":"start-file","playlist_entry_id":4}"#);
+        assert_eq!(
+            parse(r#"{"event":"property-change","id":1,"name":"time-pos","data":4.2}"#),
+            Some(PlayerEvent::Position(4, 4.2))
+        );
     }
 
     /// Plays a video of the feed in mpv with no picture or sound, as tuitok
@@ -382,8 +478,8 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             loop {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(PlayerEvent::Restarted)) => return true,
-                    Ok(Some(PlayerEvent::Failed(e))) => panic!("{e}"),
+                    Ok(Some(PlayerEvent::Restarted(_))) => return true,
+                    Ok(Some(PlayerEvent::Failed(_, e))) => panic!("{e}"),
                     Ok(Some(_)) => {}
                     _ => return false,
                 }
@@ -391,7 +487,7 @@ mod tests {
         }
         assert!(first_frame(&mut rx).await, "no frame from the stream");
         let job = cache::Job {
-            path: place.join(cache::file_name(&video.id, &rendition)),
+            path: place.join(cache::file_name(&video.id, 1, &rendition)),
             id: video.id.clone(),
             rendition,
             token: video.token.clone(),

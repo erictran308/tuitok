@@ -6,7 +6,6 @@
 //! default one), and saved one setting at a time, so whatever else the
 //! file holds stays.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -78,9 +77,8 @@ fn read(path: &Path) -> Result<Option<toml::Table>> {
 /// Sets `key` to `value` in the data folder `data`'s settings.toml,
 /// keeping what else the file holds (written by hand, or by another
 /// tuitok meanwhile); a file that can't be read is left as it is. Written
-/// to a new file readable only by you, then put in place whole.
+/// whole (`config::write_private`).
 pub fn save(data: &Path, key: &str, value: toml::Value) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let target = path(data);
     let mut table = match read(&target) {
         Ok(table) => table.unwrap_or_default(),
@@ -88,25 +86,7 @@ pub fn save(data: &Path, key: &str, value: toml::Value) -> Result<()> {
     };
     table.insert(key.to_owned(), value);
     let text = toml::to_string(&table)?;
-    // This process's own: two tuitoks saving at once don't touch each
-    // other's.
-    let part = data.join(format!("{FILE}.{}.part", std::process::id()));
-    let _ = std::fs::remove_file(&part);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&part)
-        .and_then(|mut file| {
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&part, &target));
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&part);
-        return Err(e).with_context(|| format!("cannot write {}", shown(&target)));
-    }
-    Ok(())
+    crate::config::write_private(&target, text.as_bytes())
 }
 
 #[cfg(test)]

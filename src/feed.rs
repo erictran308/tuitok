@@ -70,7 +70,8 @@ pub struct Ask {
     /// New videos: once it has these, the batch ends.
     pub want: usize,
     /// The videos the run has: they aren't counted or handed on again.
-    pub seen: HashSet<VideoId>,
+    /// Shared, as the run's set is big after a while.
+    pub seen: Arc<HashSet<VideoId>>,
     /// The guest's cookies from the batch before (`Batch::cookies`): with
     /// them TikTok goes on with that guest's feed.
     pub cookies: Vec<Value>,
@@ -181,6 +182,8 @@ pub async fn fetch(
 struct Found<'a> {
     want: usize,
     videos: Vec<Video>,
+    /// The run's videos (`Ask::seen`), and the batch's own.
+    seen: Arc<HashSet<VideoId>>,
     ids: HashSet<VideoId>,
     token: Option<Arc<str>>,
     cookies: Vec<Value>,
@@ -195,7 +198,8 @@ impl<'a> Found<'a> {
         Self {
             want: ask.want,
             videos: Vec::new(),
-            ids: ask.seen.clone(),
+            seen: ask.seen.clone(),
+            ids: HashSet::new(),
             token: None,
             cookies: Vec::new(),
             told: 0,
@@ -208,7 +212,7 @@ impl<'a> Found<'a> {
     /// Keeps the videos not seen before in this run.
     fn add(&mut self, videos: Vec<Video>) {
         for video in videos {
-            if self.ids.insert(video.id.clone()) {
+            if !self.seen.contains(&video.id) && self.ids.insert(video.id.clone()) {
                 self.videos.push(video);
             }
         }

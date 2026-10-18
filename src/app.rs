@@ -47,9 +47,18 @@ const GUESSED_SIZE: (u16, u16) = (120, 40);
 /// left after it.
 const REFILL_AT: usize = feed::BATCH - 8;
 
-/// After a batch fails, how long before one is tried again on its own (`r`
-/// tries at once).
+/// After a fetch fails, or brings nothing new, how long before one is tried
+/// again on its own (`r` tries at once).
 const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long the video shown waits for its download before it streams
+/// instead (mpv's first frame streamed: 0.2 to 0.9 s).
+const STREAM_AFTER: Duration = Duration::from_secs(1);
+
+/// The most videos kept before the one shown: older ones count as watched
+/// and are forgotten (their ids stay in `seen`, so they aren't shown
+/// again), so a run of hours doesn't hold every video it showed.
+const KEPT_BEHIND: usize = 100;
 
 /// Comments are fetched for the video shown and this many after it.
 const COMMENTS_AHEAD: usize = 1;
@@ -76,17 +85,27 @@ pub enum AppEvent {
         category: Category,
         page: Result<explore::Page, String>,
     },
-    /// How far a download has got.
+    /// How far download `number` of a video has got.
     Progress {
         id: VideoId,
+        number: u64,
         got: u64,
         of: Option<u64>,
     },
-    /// A download ended: ready, to stream, or failed.
-    Downloaded { id: VideoId, outcome: Download },
+    /// Download `number` of a video ended: ready, to stream, or failed.
+    Downloaded {
+        id: VideoId,
+        number: u64,
+        outcome: Download,
+    },
     /// A failed download's wait is over: it's tried again
     /// ([`App::try_again_later`]).
     TryAgain(VideoId),
+    /// The video shown has waited `STREAM_AFTER` for its download
+    /// ([`App::wait_to_stream`]).
+    Waited(VideoId),
+    /// A failed fetch's wait is over ([`App::rest`]).
+    Rested,
     /// A video's cover arrived and was decoded, or didn't.
     CoverFetched {
         id: VideoId,
@@ -141,8 +160,15 @@ fn first_state(engines: &[(Engine, PathBuf)]) -> FeedState {
 
 /// A step towards having the next videos downloaded ([`App::plan`]).
 enum Step {
-    Start(cache::Job),
+    /// A download, by its number in the run.
+    Start(u64, cache::Job),
     Mark(VideoId, Download),
+}
+
+/// A download under way: its number in the run, and how to stop it.
+struct Underway {
+    number: u64,
+    abort: tokio::task::AbortHandle,
 }
 
 /// The tabs of the `?` popup.
@@ -235,8 +261,12 @@ pub struct App {
     /// memory (`feed::Ask::cookies`).
     cookies: Vec<serde_json::Value>,
     failed_at: Option<Instant>,
-    /// Downloads running.
-    running: usize,
+    /// Downloads under way, by video, and the last one's number (each
+    /// download's file name and events carry its own).
+    underway: HashMap<VideoId, Underway>,
+    downloads_started: u64,
+    /// The video shown while it waits to stream ([`App::wait_to_stream`]).
+    waiting: Option<VideoId>,
     /// How many times each video's download failed: it's tried again,
     /// `cache::TRIES` in all.
     failures: HashMap<VideoId, u32>,
@@ -248,12 +278,18 @@ pub struct App {
     pub muted: bool,
     /// The program to play with and how (`main` decides: pepper-play in
     /// Pepper, else mpv's window), the player once started, how many have
-    /// been started (each one's events carry its number), and what it was
-    /// told to play.
+    /// been started (each one's events carry its number), what it was told
+    /// to play, that load's number and the playlist entry the player made
+    /// of it (what it says of any other is dropped), and whether it ended
+    /// by itself (its window closed): then none starts again until a key
+    /// asks.
     player_with: Option<(PathBuf, Kind)>,
     player: Option<Player>,
     players: u64,
     loaded: Option<VideoId>,
+    load: u64,
+    entry: Option<i64>,
+    pub player_gone: bool,
     /// Pepper's token for the player's picture (pepper-play only), and what
     /// Pepper was last told.
     token: Option<String>,
@@ -298,7 +334,7 @@ impl App {
             settings_in: None,
             help: None,
             pepper,
-            cell: cell_size(),
+            cell: cell_size().unwrap_or(GUESSED_CELL),
             size: crossterm::terminal::size().unwrap_or(GUESSED_SIZE),
             category: None,
             search: None,
@@ -326,7 +362,9 @@ impl App {
             spare: Vec::new(),
             cookies: Vec::new(),
             failed_at: None,
-            running: 0,
+            underway: HashMap::new(),
+            downloads_started: 0,
+            waiting: None,
             failures: HashMap::new(),
             volume: 100,
             volume_kept: 100,
@@ -335,6 +373,9 @@ impl App {
             player: None,
             players: 0,
             loaded: None,
+            load: 0,
+            entry: None,
+            player_gone: false,
             token: None,
             placed: None,
             covers: HashMap::new(),
@@ -352,6 +393,12 @@ impl App {
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        // The terminal window closed (SIGHUP), or tuitok was asked to end
+        // (SIGTERM, also sent by a task's panic: `main::start_screen`): it
+        // quits as with q, so the player quits, Pepper's box goes and the
+        // session's folder is deleted. Taken before any task starts.
+        let mut hangup = signal(SignalKind::hangup())?;
+        let mut terminate = signal(SignalKind::terminate())?;
         let (tx, mut app_events) = mpsc::unbounded_channel();
         self.tx = Some(tx);
         if !self.demo {
@@ -363,11 +410,6 @@ impl App {
         self.want_comments();
         self.fetch_more();
         let mut terminal_events = EventStream::new();
-        // The terminal window closed (SIGHUP), or tuitok was asked to end
-        // (SIGTERM): it quits as with q, so the player quits, Pepper's box
-        // goes and the session's folder is deleted.
-        let mut hangup = signal(SignalKind::hangup())?;
-        let mut terminate = signal(SignalKind::terminate())?;
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, self))?;
             let placement = self.placement();
@@ -395,11 +437,6 @@ impl App {
     /// The video shown, if there is one.
     pub fn current(&self) -> Option<&Video> {
         self.videos.get(self.at)
-    }
-
-    /// Whether video `id` is in the feed shown.
-    fn shows(&self, id: &VideoId) -> bool {
-        self.videos.iter().any(|v| &v.id == id)
     }
 
     /// What the feed shown is called: For You, or its category's name.
@@ -633,7 +670,7 @@ impl App {
             if self.found_so_far() < self.batch_size {
                 return Some(feed::Ask {
                     want: self.batch_size - self.found_so_far(),
-                    seen: self.seen.clone(),
+                    seen: Arc::new(self.seen.clone()),
                     cookies: self.cookies.clone(),
                 });
             }
@@ -677,14 +714,23 @@ impl App {
                 self.want_comments();
                 self.play_current();
             }
-            // What comes for a video of a feed no longer shown is dropped.
-            AppEvent::CommentsFetched { id, .. } | AppEvent::CoverFetched { id, .. }
-                if !self.shows(&id) => {}
+            AppEvent::Rested => self.refill(),
+            // What comes for a video no longer waited for (of a feed no
+            // longer shown) is dropped.
+            AppEvent::CommentsFetched { id, .. }
+                if !matches!(self.comments.get(&id), Some(Comments::Loading)) => {}
+            AppEvent::CoverFetched { id, .. }
+                if !matches!(self.covers.get(&id), Some(Cover::Loading)) => {}
             AppEvent::CommentsFetched { id, comments } => {
                 let comments = comments.map_or(Comments::Failed, Comments::Ready);
                 self.comments.insert(id, comments);
             }
-            AppEvent::Progress { id, got, of } => {
+            AppEvent::Progress {
+                id,
+                number,
+                got,
+                of,
+            } if self.is_underway(&id, number) => {
                 if let Some(Download::Getting {
                     got: was,
                     of: total,
@@ -694,15 +740,20 @@ impl App {
                     *total = of.or(*total);
                 }
             }
-            AppEvent::Downloaded { id, outcome } if !self.shows(&id) => {
-                self.running = self.running.saturating_sub(1);
+            AppEvent::Progress { .. } => {}
+            // A download stopped (or of a feed no longer shown) that ended
+            // just before: its file goes.
+            AppEvent::Downloaded {
+                id,
+                number,
+                outcome,
+            } if !self.is_underway(&id, number) => {
                 if let Download::Ready(path) = outcome {
                     let _ = std::fs::remove_file(path);
                 }
-                self.prefetch();
             }
-            AppEvent::Downloaded { id, outcome } => {
-                self.running = self.running.saturating_sub(1);
+            AppEvent::Downloaded { id, outcome, .. } => {
+                self.underway.remove(&id);
                 if matches!(outcome, Download::Failed(_)) {
                     self.try_again_later(&id);
                 }
@@ -711,6 +762,7 @@ impl App {
                 self.play_current();
             }
             AppEvent::TryAgain(id) => self.try_again(&id),
+            AppEvent::Waited(id) => self.stream_instead(&id),
             AppEvent::CoverFetched { id, picture } => {
                 let cover = match picture {
                     Ok(picture) => Cover::Ready {
@@ -782,7 +834,7 @@ impl App {
             }
             Err(e) => {
                 self.feed = FeedState::Failed(text::one_line(&e, 300));
-                self.failed_at = Some(Instant::now());
+                self.rest();
             }
         }
         self.batch_from = self.videos.len();
@@ -826,17 +878,37 @@ impl App {
             Ok(page) => {
                 let before = self.videos.len();
                 self.add(page.videos);
+                let new = self.videos.len() - before;
                 self.feed = FeedState::Explored {
-                    new: self.videos.len() - before,
+                    new,
                     took: page.took,
                 };
-                self.failed_at = None;
+                // All seen before: the next page waits, as after a failure.
+                if new == 0 {
+                    self.rest();
+                } else {
+                    self.failed_at = None;
+                }
             }
             Err(e) => {
                 self.feed = FeedState::Failed(text::one_line(&e, 300));
-                self.failed_at = Some(Instant::now());
+                self.rest();
             }
         }
+    }
+
+    /// A fetch failed, or brought nothing new: the next waits `RETRY_AFTER`,
+    /// then starts on its own if the feed shown still wants more
+    /// ([`App::wants_more`]; `r` starts it at once).
+    fn rest(&mut self) {
+        self.failed_at = Some(Instant::now());
+        let Some(tx) = self.tx.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(RETRY_AFTER).await;
+            let _ = tx.send(AppEvent::Rested);
+        });
     }
 
     /// Shows `category` (For You: `None`) in place of the feed shown, from
@@ -855,12 +927,18 @@ impl App {
         let watched = self.videos[..shown].iter().map(|v| v.id.clone());
         self.watched_before.extend(watched);
         self.stop_playing();
-        // Downloads under way are deleted as they end (`AppEvent::Downloaded`).
+        self.player_gone = false;
+        // Downloads under way stop, their part files with them
+        // (`cache::download`).
+        for (_, underway) in self.underway.drain() {
+            underway.abort.abort();
+        }
         for (_, download) in self.downloads.drain() {
             if let Download::Ready(path) = download {
                 let _ = std::fs::remove_file(path);
             }
         }
+        self.waiting = None;
         self.failures.clear();
         self.covers.clear();
         self.comments.clear();
@@ -880,29 +958,50 @@ impl App {
 
     fn on_player(&mut self, event: PlayerEvent) {
         match event {
-            PlayerEvent::Restarted => self.playing = self.loaded.clone(),
-            PlayerEvent::Position(seconds) => self.position = seconds,
-            PlayerEvent::Duration(seconds) => self.duration = Some(seconds),
+            PlayerEvent::Loaded { load, entry } => {
+                if self.loaded.is_some() && load == self.load {
+                    self.entry = Some(entry);
+                }
+            }
+            PlayerEvent::Restarted(entry) if self.entry == Some(entry) => {
+                self.playing = self.loaded.clone();
+            }
+            PlayerEvent::Position(entry, seconds) if self.entry == Some(entry) => {
+                self.position = seconds;
+            }
+            PlayerEvent::Duration(entry, seconds) if self.entry == Some(entry) => {
+                self.duration = Some(seconds);
+            }
+            PlayerEvent::Failed(entry, e) if self.entry == Some(entry) => {
+                self.playing = None;
+                self.play_error = Some(format!("It can't play: {e}"));
+            }
+            // Of a file before the one loaded: it looped, or ended, just as
+            // the next was loaded.
+            PlayerEvent::Restarted(_)
+            | PlayerEvent::Position(..)
+            | PlayerEvent::Duration(..)
+            | PlayerEvent::Failed(..) => {}
             PlayerEvent::Paused(paused) => self.paused = paused,
             // Changed in mpv's window too: the next video plays as loud.
             PlayerEvent::Volume(volume) => self.volume = volume.round().clamp(0.0, 100.0) as u32,
             PlayerEvent::Muted(muted) => self.muted = muted,
-            PlayerEvent::Failed(e) => {
-                self.playing = None;
-                self.play_error = Some(format!("It can't play: {e}"));
-            }
             PlayerEvent::Exited => {
                 self.player = None;
                 self.token = None;
                 self.loaded = None;
+                self.entry = None;
                 self.playing = None;
+                // Its window closed: a download ending isn't a reason to
+                // open another.
+                self.player_gone = true;
             }
         }
     }
 
     /// What would play for the video shown, if it can play yet: its file
     /// once downloaded, else its address streamed (too big to download, or
-    /// the download failed).
+    /// the download failed, or took too long: [`App::stream_instead`]).
     fn target(&self) -> Option<Target> {
         let video = self.current()?;
         match self.downloads.get(&video.id)? {
@@ -919,7 +1018,8 @@ impl App {
     }
 
     /// Plays the video shown if it can and isn't already; while it can't
-    /// yet, the player stops, so the last one doesn't play on under it.
+    /// yet, the player stops, so the last one doesn't play on under it, and
+    /// the video waits to stream instead.
     fn play_current(&mut self) {
         if self.demo {
             return;
@@ -932,14 +1032,18 @@ impl App {
         }
         let Some(target) = self.target() else {
             self.stop_playing();
+            // Why the one before couldn't play isn't this one's.
+            self.play_error = None;
+            self.wait_to_stream(&id);
             return;
         };
         if !self.start_player() {
             return;
         }
         if let Some(player) = &self.player {
-            player.load(&target);
+            self.load = player.load(&target);
         }
+        self.entry = None;
         self.loaded = Some(id);
         self.playing = None;
         self.position = 0.0;
@@ -954,13 +1058,56 @@ impl App {
         {
             player.stop();
         }
+        self.entry = None;
         self.playing = None;
     }
 
-    /// Starts the player unless it runs; whether it runs.
+    /// The video shown can't play yet: unless it can within `STREAM_AFTER`,
+    /// it streams then ([`App::stream_instead`]).
+    fn wait_to_stream(&mut self, id: &VideoId) {
+        if self.waiting.as_ref() == Some(id) {
+            return;
+        }
+        let Some(tx) = self.tx.clone() else {
+            return;
+        };
+        self.waiting = Some(id.clone());
+        let id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STREAM_AFTER).await;
+            let _ = tx.send(AppEvent::Waited(id));
+        });
+    }
+
+    /// The video shown waited `STREAM_AFTER` for its download (under way,
+    /// or waiting for its turn): if it still waits, it streams, and its
+    /// download stops, as one that plays streamed isn't downloaded as well.
+    fn stream_instead(&mut self, id: &VideoId) {
+        if self.waiting.as_ref() == Some(id) {
+            self.waiting = None;
+        }
+        let still_waits = self.current().is_some_and(|v| &v.id == id)
+            && matches!(
+                self.downloads.get(id),
+                None | Some(Download::Getting { .. })
+            );
+        if !still_waits {
+            return;
+        }
+        self.cancel(id);
+        self.downloads.insert(id.clone(), Download::Streams);
+        self.prefetch();
+        self.play_current();
+    }
+
+    /// Starts the player unless it runs (or ended by itself, until a key
+    /// asks); whether it runs.
     fn start_player(&mut self) -> bool {
         if self.player.is_some() {
             return true;
+        }
+        if self.player_gone {
+            return false;
         }
         let Some((program, kind)) = self.player_with.clone() else {
             self.play_error = Some(NO_PLAYER.into());
@@ -1025,17 +1172,15 @@ impl App {
 
     /// What to do so the video shown and the `cache::AHEAD` after it are
     /// downloaded, nearest first, `cache::PARALLEL` at a time: start a
-    /// download, or mark a video that won't be downloaded (too big, or
-    /// nothing in it plays).
+    /// download (numbered after the last), or mark a video that won't be
+    /// downloaded (too big, or nothing in it plays), which takes no turn.
     fn plan(&self) -> Vec<Step> {
         let mut steps = Vec::new();
-        let mut running = self.running;
+        let mut running = self.underway.len();
+        let mut number = self.downloads_started;
         let box_pixels = self.box_pixels();
         let end = (self.at + cache::AHEAD + 1).min(self.videos.len());
         for video in self.videos.get(self.at..end).unwrap_or_default() {
-            if running >= cache::PARALLEL {
-                break;
-            }
             if self.downloads.contains_key(&video.id) {
                 continue;
             }
@@ -1048,22 +1193,31 @@ impl App {
                 Some(r) if r.bytes.is_some_and(|bytes| bytes > cache::DOWNLOAD_UP_TO) => {
                     steps.push(Step::Mark(id, Download::Streams));
                 }
+                // Its turn comes when one under way ends.
+                Some(_) if running >= cache::PARALLEL => {}
                 Some(r) => {
                     running += 1;
-                    steps.push(Step::Start(cache::Job {
-                        path: self.cache.join(cache::file_name(&id, r)),
-                        id,
-                        rendition: r.clone(),
-                        token: video.token.clone(),
-                    }));
+                    number += 1;
+                    steps.push(Step::Start(
+                        number,
+                        cache::Job {
+                            path: self.cache.join(cache::file_name(&id, number, r)),
+                            id,
+                            rendition: r.clone(),
+                            token: video.token.clone(),
+                        },
+                    ));
                 }
             }
         }
         steps
     }
 
-    /// Carries out [`App::plan`].
+    /// Stops the downloads no longer wanted (of videos behind the one
+    /// shown, or more than `cache::AHEAD` after it), then carries out
+    /// [`App::plan`].
     fn prefetch(&mut self) {
+        self.cancel_unwanted();
         let (Some(client), Some(tx)) = (self.client.clone(), self.tx.clone()) else {
             return;
         };
@@ -1072,20 +1226,22 @@ impl App {
                 Step::Mark(id, outcome) => {
                     self.downloads.insert(id, outcome);
                 }
-                Step::Start(job) => {
-                    self.running += 1;
+                Step::Start(number, job) => {
+                    self.downloads_started = number;
                     let getting = Download::Getting {
                         got: 0,
                         of: job.rendition.bytes,
                     };
-                    self.downloads.insert(job.id.clone(), getting);
+                    let id = job.id.clone();
+                    self.downloads.insert(id.clone(), getting);
                     let (client, tx) = (client.clone(), tx.clone());
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         let progress = {
                             let (tx, id) = (tx.clone(), job.id.clone());
                             move |got, of| {
                                 let _ = tx.send(AppEvent::Progress {
                                     id: id.clone(),
+                                    number,
                                     got,
                                     of,
                                 });
@@ -1094,11 +1250,45 @@ impl App {
                         let outcome = cache::download(&client, &job, progress).await;
                         let _ = tx.send(AppEvent::Downloaded {
                             id: job.id,
+                            number,
                             outcome,
                         });
                     });
+                    let abort = task.abort_handle();
+                    self.underway.insert(id, Underway { number, abort });
                 }
             }
+        }
+    }
+
+    /// Whether download `number` of video `id` is still wanted: not
+    /// stopped, nor of a feed no longer shown.
+    fn is_underway(&self, id: &VideoId, number: u64) -> bool {
+        self.underway.get(id).is_some_and(|u| u.number == number)
+    }
+
+    /// Stops the downloads of videos not among the video shown and the
+    /// `cache::AHEAD` after it, so those get their turn.
+    fn cancel_unwanted(&mut self) {
+        let end = (self.at + cache::AHEAD + 1).min(self.videos.len());
+        let wanted = self.videos.get(self.at..end).unwrap_or_default();
+        let unwanted: Vec<VideoId> = self
+            .underway
+            .keys()
+            .filter(|id| !wanted.iter().any(|v| &v.id == *id))
+            .cloned()
+            .collect();
+        for id in unwanted {
+            self.cancel(&id);
+        }
+    }
+
+    /// Stops video `id`'s download, if one's under way; its part file goes
+    /// with it (`cache::download`).
+    fn cancel(&mut self, id: &VideoId) {
+        if let Some(underway) = self.underway.remove(id) {
+            underway.abort.abort();
+            self.downloads.remove(id);
         }
     }
 
@@ -1243,7 +1433,9 @@ impl App {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
             Event::Resize(columns, rows) => {
-                self.cell = cell_size();
+                // A terminal that doesn't say keeps the size found before
+                // (by the picker, `set_picker`).
+                self.cell = cell_size().unwrap_or(self.cell);
                 self.size = (columns, rows);
                 self.want_covers();
             }
@@ -1488,13 +1680,17 @@ impl App {
         }
     }
 
-    /// Shows the video `by` from this one, within the feed.
+    /// Shows the video `by` from this one, within the feed. A key asks, so a
+    /// player that ended by itself starts again.
     fn go(&mut self, by: isize) {
+        self.player_gone = false;
         if self.videos.is_empty() {
+            self.refill();
             return;
         }
         self.at = self.at.saturating_add_signed(by).min(self.videos.len() - 1);
         self.furthest = self.furthest.max(self.at);
+        self.forget_behind();
         self.prune();
         self.prefetch();
         self.want_covers();
@@ -1503,13 +1699,40 @@ impl App {
         self.refill();
     }
 
-    /// Fetches more once few videos are left, unless a batch failed lately.
+    /// Forgets the videos more than `KEPT_BEHIND` before the one shown:
+    /// they count as watched, and `k` goes back no further.
+    fn forget_behind(&mut self) {
+        let gone = self.at.saturating_sub(KEPT_BEHIND);
+        if gone == 0 {
+            return;
+        }
+        for video in self.videos.drain(..gone) {
+            self.failures.remove(&video.id);
+            if let Some(Download::Ready(path)) = self.downloads.remove(&video.id) {
+                let _ = std::fs::remove_file(path);
+            }
+            self.watched_before.push(video.id);
+        }
+        self.at -= gone;
+        self.furthest -= gone;
+        self.batch_from = self.batch_from.saturating_sub(gone);
+    }
+
+    /// Fetches more if the feed shown wants more now.
     fn refill(&mut self) {
-        let left = self.videos.len().saturating_sub(self.at + 1);
-        let resting = self.failed_at.is_some_and(|at| at.elapsed() < RETRY_AFTER);
-        if left <= REFILL_AT && !resting {
+        if self.wants_more() {
             self.fetch_more();
         }
+    }
+
+    /// Whether the feed shown wants more now: few videos are left after the
+    /// one shown, or For You's first batches are still growing; and no
+    /// fetch failed lately (then it waits `RETRY_AFTER`: `AppEvent::Rested`).
+    fn wants_more(&self) -> bool {
+        let left = self.videos.len().saturating_sub(self.at + 1);
+        let growing = self.category.is_none() && self.ramping();
+        let resting = self.failed_at.is_some_and(|at| at.elapsed() < RETRY_AFTER);
+        (left <= REFILL_AT || growing) && !resting
     }
 }
 
@@ -1524,13 +1747,13 @@ fn write_to_terminal(text: &str) -> io::Result<()> {
 }
 
 /// A cell's size in pixels: the terminal's size in pixels over its size in
-/// cells (`TIOCGWINSZ`), else [`GUESSED_CELL`].
-fn cell_size() -> (u16, u16) {
+/// cells (`TIOCGWINSZ`), if it says.
+fn cell_size() -> Option<(u16, u16)> {
     match crossterm::terminal::window_size() {
         Ok(s) if s.columns > 0 && s.rows > 0 && s.width > 0 && s.height > 0 => {
-            (s.width / s.columns, s.height / s.rows)
+            Some((s.width / s.columns, s.height / s.rows))
         }
-        _ => GUESSED_CELL,
+        _ => None,
     }
 }
 
@@ -1574,6 +1797,17 @@ pub mod tests {
         } else {
             app.player_with = Some((PathBuf::from("/opt/homebrew/bin/mpv"), Kind::Window));
         }
+    }
+
+    /// Download `number` of video `id` under way, as `prefetch` starts one
+    /// (a task that never ends stands in for it).
+    fn under_way(app: &mut App, id: &str, number: u64) {
+        let id = VideoId::new(id).unwrap();
+        let abort = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        let getting = Download::Getting { got: 0, of: None };
+        app.downloads.insert(id.clone(), getting);
+        app.underway.insert(id, Underway { number, abort });
+        app.downloads_started = app.downloads_started.max(number);
     }
 
     #[test]
@@ -1712,8 +1946,8 @@ pub mod tests {
         assert!(!app.fetching);
     }
 
-    #[test]
-    fn downloads_are_planned_nearest_first_and_big_ones_stream() {
+    #[tokio::test]
+    async fn downloads_are_planned_nearest_first_and_big_ones_stream() {
         let mut videos: Vec<Video> = (1..=6)
             .map(|n| crate::ui::tests::video(&n.to_string()))
             .collect();
@@ -1727,54 +1961,97 @@ pub mod tests {
             app.plan()
                 .into_iter()
                 .map(|step| match step {
-                    Step::Start(job) => format!("start {}", job.id.as_str()),
+                    Step::Start(number, job) => format!("start {} #{number}", job.id.as_str()),
                     Step::Mark(id, Download::Streams) => format!("stream {}", id.as_str()),
                     Step::Mark(id, _) => format!("skip {}", id.as_str()),
                 })
                 .collect::<Vec<_>>()
         };
-        // Two at a time: the first, the second marked to stream, the third.
-        assert_eq!(plan(&app), ["start 1", "stream 2", "start 3"]);
+        // Two at a time: the first, the second marked to stream, the third;
+        // the fourth, with nothing that plays, takes no turn.
+        assert_eq!(
+            plan(&app),
+            ["start 1 #1", "stream 2", "start 3 #2", "skip 4"]
+        );
         let job_path = match app.plan().remove(0) {
-            Step::Start(job) => job.path,
+            Step::Start(_, job) => job.path,
             Step::Mark(..) => unreachable!(),
         };
         assert_eq!(
             job_path,
-            PathBuf::from("/nowhere/cache/1-h265-720x1280.mp4")
+            PathBuf::from("/nowhere/cache/1-1-h265-720x1280.mp4")
         );
         // With those under way, the rest come as they finish.
-        let started = Download::Getting { got: 0, of: None };
-        app.downloads
-            .insert(VideoId::new("1").unwrap(), started.clone());
+        under_way(&mut app, "1", 1);
         app.downloads
             .insert(VideoId::new("2").unwrap(), Download::Streams);
-        app.downloads.insert(VideoId::new("3").unwrap(), started);
-        app.running = 2;
-        assert!(plan(&app).is_empty());
+        under_way(&mut app, "3", 2);
+        assert_eq!(plan(&app), ["skip 4"]);
         app.on_app_event(AppEvent::Downloaded {
             id: VideoId::new("1").unwrap(),
+            number: 1,
             outcome: Download::Ready("/nowhere/cache/1.mp4".into()),
         });
-        assert_eq!(plan(&app), ["skip 4"]);
+        assert!(matches!(
+            app.downloads[&VideoId::new("1").unwrap()],
+            Download::Ready(_)
+        ));
         // Only the video shown and the three after it.
         app.at = 2;
         app.downloads
             .insert(VideoId::new("4").unwrap(), Download::Failed("x".into()));
-        assert_eq!(plan(&app), ["start 5"]);
+        assert_eq!(plan(&app), ["start 5 #3"]);
+        // A download of a video now behind the one shown stops, and its turn
+        // goes to one ahead.
+        app.at = 3;
+        app.prefetch();
+        let three = VideoId::new("3").unwrap();
+        assert!(app.underway.is_empty() && !app.downloads.contains_key(&three));
+        assert_eq!(plan(&app), ["start 5 #3", "start 6 #4"]);
     }
 
-    #[test]
-    fn progress_updates_a_download_under_way() {
+    #[tokio::test]
+    async fn the_video_shown_streams_if_its_download_keeps_it_waiting() {
+        let mut app = app_with(["1", "2", "3"].map(crate::ui::tests::video).to_vec());
+        let id = |n: &str| VideoId::new(n).unwrap();
+        // 1's download is under way: it waits, then streams, and the
+        // download stops.
+        under_way(&mut app, "1", 1);
+        app.on_app_event(AppEvent::Waited(id("1")));
+        assert!(app.underway.is_empty());
+        assert_eq!(app.downloads[&id("1")], Download::Streams);
+        // 2's waits its turn behind two others: it streams too.
+        app.downloads.clear();
+        app.at = 1;
+        under_way(&mut app, "3", 2);
+        under_way(&mut app, "4", 3);
+        assert!(!app.plan().iter().any(|s| matches!(s, Step::Start(..))));
+        app.on_app_event(AppEvent::Waited(id("2")));
+        assert_eq!(app.downloads[&id("2")], Download::Streams);
+        // One not shown any more, or that can play by now, is left as it is.
+        app.on_app_event(AppEvent::Waited(id("3")));
+        assert!(matches!(app.downloads[&id("3")], Download::Getting { .. }));
+        app.at = 2;
+        app.downloads
+            .insert(id("3"), Download::Ready("/nowhere/cache/3.mp4".into()));
+        app.on_app_event(AppEvent::Waited(id("3")));
+        assert!(matches!(app.downloads[&id("3")], Download::Ready(_)));
+    }
+
+    #[tokio::test]
+    async fn progress_updates_a_download_under_way() {
         let mut app = app_with(vec![crate::ui::tests::video("1")]);
         let id = VideoId::new("1").unwrap();
-        app.downloads
-            .insert(id.clone(), Download::Getting { got: 0, of: None });
-        app.on_app_event(AppEvent::Progress {
+        under_way(&mut app, "1", 4);
+        let progress = |number, got| AppEvent::Progress {
             id: id.clone(),
-            got: 300,
+            number,
+            got,
             of: Some(1_000),
-        });
+        };
+        app.on_app_event(progress(4, 300));
+        // A download stopped before says nothing of this one.
+        app.on_app_event(progress(3, 900));
         assert_eq!(
             app.downloads[&id],
             Download::Getting {
@@ -1838,26 +2115,29 @@ pub mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    #[test]
-    fn a_failed_download_is_tried_again_unless_it_streams_meanwhile() {
+    #[tokio::test]
+    async fn a_failed_download_is_tried_again_unless_it_streams_meanwhile() {
         let mut app = app_with(vec![
             crate::ui::tests::video("1"),
             crate::ui::tests::video("2"),
         ]);
         let (one, two) = (VideoId::new("1").unwrap(), VideoId::new("2").unwrap());
-        let failed = |id: &VideoId| AppEvent::Downloaded {
-            id: id.clone(),
+        let failed = |number| AppEvent::Downloaded {
+            id: two.clone(),
+            number,
             outcome: Download::Failed("HTTP 503".into()),
         };
         app.downloads
             .insert(one.clone(), Download::Ready("/nowhere/cache/1.mp4".into()));
-        app.on_app_event(failed(&two));
+        under_way(&mut app, "2", 1);
+        app.on_app_event(failed(1));
         assert_eq!(app.failures[&two], 1);
         // Its wait is over: downloaded again.
         app.on_app_event(AppEvent::TryAgain(two.clone()));
         assert!(!app.downloads.contains_key(&two));
-        assert!(matches!(&app.plan()[..], [Step::Start(job)] if job.id == two));
-        app.on_app_event(failed(&two));
+        assert!(matches!(&app.plan()[..], [Step::Start(2, job)] if job.id == two));
+        under_way(&mut app, "2", 2);
+        app.on_app_event(failed(2));
         assert_eq!(app.failures[&two], 2);
         // Shown and streamed meanwhile: not downloaded as well.
         app.loaded = Some(two.clone());
@@ -1866,6 +2146,97 @@ pub mod tests {
         // One that isn't failed any more is left as it is.
         app.on_app_event(AppEvent::TryAgain(one.clone()));
         assert!(matches!(app.downloads[&one], Download::Ready(_)));
+    }
+
+    #[test]
+    fn an_error_is_the_video_shown_s_own() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        app.loaded = Some(VideoId::new("1").unwrap());
+        app.play_error = Some("It can't play: loading failed".into());
+        // 2 can't play yet: 1's error isn't shown on it.
+        app.downloads.insert(
+            VideoId::new("2").unwrap(),
+            Download::Getting { got: 0, of: None },
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!((app.at, app.play_error.as_deref()), (1, None));
+    }
+
+    #[test]
+    fn a_closed_player_opens_again_only_when_a_key_asks() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        for n in ["1", "2"] {
+            let path = PathBuf::from(format!("/nowhere/cache/{n}.mp4"));
+            app.downloads
+                .insert(VideoId::new(n).unwrap(), Download::Ready(path));
+        }
+        app.players = 1;
+        app.loaded = Some(VideoId::new("1").unwrap());
+        app.on_app_event(AppEvent::Player {
+            player: 1,
+            event: PlayerEvent::Exited,
+        });
+        assert!(app.player_gone && app.loaded.is_none());
+        // A download ending (or a batch) doesn't open it again.
+        app.play_current();
+        assert!(app.loaded.is_none() && app.play_error.is_none());
+        // j does (here there's none to start, so it says so).
+        press(&mut app, KeyCode::Char('j'));
+        assert!(!app.player_gone);
+        assert_eq!(app.play_error.as_deref(), Some(NO_PLAYER));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_tried_again_once_its_wait_is_over() {
+        let mut app = app_with(Vec::new());
+        app.on_batch(Err("Lightpanda: no".into()));
+        assert!(!app.wants_more(), "it waits");
+        // Its wait is over (`AppEvent::Rested`): an empty feed wants more.
+        app.failed_at = Instant::now().checked_sub(RETRY_AFTER);
+        assert!(app.wants_more());
+        // So does one whose first batches are still growing, but not one
+        // with plenty left after the video shown.
+        let mut app = app_with(
+            (1..=13)
+                .map(|n| crate::ui::tests::video(&n.to_string()))
+                .collect(),
+        );
+        assert!(app.wants_more(), "still growing");
+        app.batches = feed::SIZES.len();
+        assert!(!app.wants_more());
+        app.at = 12;
+        assert!(app.wants_more());
+        // A category's page with nothing new waits as a failure does.
+        app.category = Some(explore::CATEGORIES[2]);
+        app.on_explored(explore::CATEGORIES[2], page(&["1"]));
+        assert!(app.failed_at.is_some() && !app.wants_more());
+    }
+
+    #[test]
+    fn videos_far_behind_are_forgotten_and_count_as_watched() {
+        let videos = (1..=KEPT_BEHIND + 5)
+            .map(|n| crate::ui::tests::video(&n.to_string()))
+            .collect();
+        let mut app = app_with(videos);
+        for _ in 0..KEPT_BEHIND + 2 {
+            app.go(1);
+        }
+        assert_eq!((app.at, app.videos.len()), (KEPT_BEHIND, KEPT_BEHIND + 3));
+        assert_eq!(app.videos[0].id.as_str(), "3");
+        let watched = app.carry_out().watched;
+        assert_eq!((watched.len(), watched[0].as_str()), (KEPT_BEHIND + 3, "1"));
+        // TikTok sends 1 again: it isn't shown.
+        app.add(vec![crate::ui::tests::video("1")]);
+        assert_eq!(app.videos.len(), KEPT_BEHIND + 3);
+    }
+
+    #[test]
+    fn a_resize_keeps_the_cell_size_found_when_the_terminal_doesnt_say() {
+        let mut app = app_with(Vec::new());
+        app.cell = (10, 20);
+        app.on_event(Event::Resize(100, 30));
+        assert_eq!(app.cell, cell_size().unwrap_or((10, 20)));
+        assert_eq!(app.size, (100, 30));
     }
 
     #[test]
@@ -2015,8 +2386,8 @@ pub mod tests {
         assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
     }
 
-    #[test]
-    fn a_category_picked_takes_the_place_of_for_you_from_its_start() {
+    #[tokio::test]
+    async fn a_category_picked_takes_the_place_of_for_you_from_its_start() {
         let mut app = app_with(["1", "2", "3"].map(crate::ui::tests::video).to_vec());
         let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(format!("target/test-explore-{}.mp4", std::process::id()));
@@ -2025,6 +2396,7 @@ pub mod tests {
             .insert(VideoId::new("1").unwrap(), Download::Ready(file.clone()));
         app.go(1);
         set_playing(&mut app, "2", false);
+        under_way(&mut app, "3", 1);
         for key in [
             KeyCode::Char('/'),
             KeyCode::Char('c'),
@@ -2040,6 +2412,7 @@ pub mod tests {
         assert_eq!(app.feed, FeedState::Exploring);
         assert!(app.videos.is_empty() && app.at == 0 && app.downloads.is_empty());
         assert!(!file.exists(), "the old feed's downloads go");
+        assert!(app.underway.is_empty(), "and stop");
         assert!(app.loaded.is_none() && !app.shows_picture());
         // What was shown counts as watched: 1 and 2, not 3.
         let watched: Vec<String> = app
@@ -2077,14 +2450,14 @@ pub mod tests {
                 took: Duration::from_millis(600)
             }
         );
-        // A late download of the old feed is deleted, not kept.
+        // The end of one stopped, if it came all the same, is dropped.
         std::fs::write(&file, b"x").unwrap();
-        app.running = 1;
         app.on_app_event(AppEvent::Downloaded {
             id: VideoId::new("3").unwrap(),
+            number: 1,
             outcome: Download::Ready(file.clone()),
         });
-        assert!(!file.exists() && app.running == 0);
+        assert!(!file.exists() && app.underway.is_empty());
         assert!(!app.downloads.contains_key(&VideoId::new("3").unwrap()));
         // A page that fails says so; the guest goes.
         app.on_app_event(AppEvent::Explored {
@@ -2122,40 +2495,47 @@ pub mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
     }
+
     #[test]
     fn the_players_words() {
-        let mut app = app_with(vec![crate::ui::tests::video("1")]);
-        app.loaded = Some(VideoId::new("1").unwrap());
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        let said = |app: &mut App, event| {
+            app.on_app_event(AppEvent::Player { player: 2, event });
+        };
         app.players = 2;
-        app.on_app_event(AppEvent::Player {
-            player: 2,
-            event: PlayerEvent::Restarted,
-        });
+        (app.loaded, app.load) = (Some(VideoId::new("1").unwrap()), 1);
+        said(&mut app, PlayerEvent::Loaded { load: 1, entry: 1 });
+        said(&mut app, PlayerEvent::Restarted(1));
         assert!(app.shows_picture());
-        app.on_app_event(AppEvent::Player {
-            player: 2,
-            event: PlayerEvent::Paused(true),
-        });
-        assert!(app.paused);
+        said(&mut app, PlayerEvent::Paused(true));
+        said(&mut app, PlayerEvent::Position(1, 3.0));
+        assert_eq!((app.paused, app.position), (true, 3.0));
         // An older player's words are dropped.
         app.on_app_event(AppEvent::Player {
             player: 1,
             event: PlayerEvent::Exited,
         });
         assert!(app.shows_picture());
-        app.on_app_event(AppEvent::Player {
-            player: 2,
-            event: PlayerEvent::Failed("loading failed".into()),
-        });
+        // The next video is loaded (as `play_current` does): what the one
+        // before says as it loops or ends meanwhile isn't taken for its.
+        app.at = 1;
+        (app.loaded, app.load, app.entry) = (Some(VideoId::new("2").unwrap()), 2, None);
+        (app.playing, app.position) = (None, 0.0);
+        said(&mut app, PlayerEvent::Restarted(1));
+        said(&mut app, PlayerEvent::Loaded { load: 2, entry: 2 });
+        said(&mut app, PlayerEvent::Position(1, 9.0));
+        said(&mut app, PlayerEvent::Failed(1, "loading failed".into()));
+        assert!(!app.shows_picture());
+        assert_eq!((app.position, app.play_error.as_deref()), (0.0, None));
+        said(&mut app, PlayerEvent::Restarted(2));
+        assert!(app.shows_picture());
+        said(&mut app, PlayerEvent::Failed(2, "loading failed".into()));
         assert!(!app.shows_picture());
         assert_eq!(
             app.play_error.as_deref(),
             Some("It can't play: loading failed")
         );
-        app.on_app_event(AppEvent::Player {
-            player: 2,
-            event: PlayerEvent::Exited,
-        });
-        assert!(app.loaded.is_none() && app.token.is_none());
+        said(&mut app, PlayerEvent::Exited);
+        assert!(app.loaded.is_none() && app.token.is_none() && app.player_gone);
     }
 }

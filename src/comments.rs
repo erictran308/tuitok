@@ -50,7 +50,7 @@ pub fn url(id: &VideoId) -> String {
 
 /// Video `id`'s top comments, off the event loop.
 pub async fn fetch(client: &reqwest::Client, id: &VideoId) -> Result<Vec<Comment>> {
-    let mut response = client
+    let response = client
         .get(url(id))
         .header(reqwest::header::USER_AGENT, cache::USER_AGENT)
         .header(reqwest::header::REFERER, cache::REFERER)
@@ -60,13 +60,7 @@ pub async fn fetch(client: &reqwest::Client, id: &VideoId) -> Result<Vec<Comment
     if response.status() != reqwest::StatusCode::OK {
         bail!("HTTP {}", response.status().as_u16());
     }
-    let mut data = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if data.len() + chunk.len() > MAX_BYTES {
-            bail!("the answer is too big");
-        }
-        data.extend_from_slice(&chunk);
-    }
+    let data = cache::read_capped(response, MAX_BYTES, "the answer").await?;
     Ok(parse(&serde_json::from_slice(&data)?))
 }
 
