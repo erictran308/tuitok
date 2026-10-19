@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::{COOKIE, REFERER, SET_COOKIE, USER_AGENT};
+use reqwest::header::{COOKIE, HeaderMap, REFERER, SET_COOKIE, USER_AGENT};
 use serde_json::Value;
 
 use crate::cache;
@@ -175,20 +175,23 @@ async fn new_guest(client: &reqwest::Client) -> Result<Guest> {
     if response.status() != reqwest::StatusCode::OK {
         bail!("Explore's page: HTTP {}", response.status().as_u16());
     }
-    let cookie = |name: &str| {
-        response
-            .headers()
-            .get_all(SET_COOKIE)
-            .iter()
-            .filter_map(|header| header.to_str().ok())
-            .find_map(|header| set_cookie(header, name))
-    };
+    let cookie = |name: &str| cookie_set(response.headers(), name);
     Ok(Guest {
         ttwid: cookie("ttwid").context("TikTok made no guest (no ttwid)")?,
         token: Arc::from(
             cookie("tt_chain_token").context("TikTok made no guest (no tt_chain_token)")?,
         ),
     })
+}
+
+/// What an answer's `Set-Cookie` headers set cookie `name` to, if it fits in
+/// a `Cookie` header as it is (a video's page sets one too: `links`).
+pub fn cookie_set(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .find_map(|header| set_cookie(header, name))
 }
 
 /// The value cookie `name` is set to in a `Set-Cookie` header, if it fits

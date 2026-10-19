@@ -27,6 +27,7 @@ use crate::covers::{self, Cover, Encoded};
 use crate::demo;
 use crate::explore::{self, Category};
 use crate::feed::{self, Batch};
+use crate::links::{self, Link};
 use crate::pepper::{self, Placed};
 use crate::player::{Kind, Player, PlayerEvent, Sound, Target};
 use crate::settings::{self, Settings};
@@ -74,6 +75,10 @@ const NO_PLAYER: &str = "No player: brew install mpv";
 /// The most characters the command line (`/`) takes.
 const MAX_SEARCH: usize = 40;
 
+/// The most characters the command line `:` takes: `open` and the longest
+/// link read.
+const MAX_COMMAND: usize = links::MAX_LINK + 16;
+
 /// What tuitok's own tasks tell the event loop.
 pub enum AppEvent {
     /// Videos of the batch being fetched, as the page gets them.
@@ -84,6 +89,12 @@ pub enum AppEvent {
     Explored {
         category: Category,
         page: Result<explore::Page, String>,
+    },
+    /// The video link `number` of the run is to came, or didn't (an older
+    /// link's is dropped).
+    Opened {
+        number: u64,
+        video: Result<Video, String>,
     },
     /// How far download `number` of a video has got.
     Progress {
@@ -202,6 +213,50 @@ pub struct Search {
     pub scroll: Cell<usize>,
 }
 
+/// The command line `:` opens, as tuitube's: what's typed, and why the line
+/// Enter ran couldn't run (until it's edited).
+#[derive(Debug, Default, PartialEq)]
+pub struct CommandLine {
+    pub text: String,
+    pub error: Option<String>,
+}
+
+/// A command `:` runs: its name, its argument as its box shows it, and what
+/// it does (tuitube's `commands::Spec`, cut down).
+#[derive(Debug, PartialEq)]
+pub struct Spec {
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub about: &'static str,
+}
+
+pub const COMMANDS: [Spec; 1] = [Spec {
+    name: "open",
+    hint: "<link>",
+    about: "play a TikTok link",
+}];
+
+/// The commands `:`'s box offers for `typed`: those whose names start with
+/// it, while it's one word.
+pub fn completions(typed: &str) -> Vec<&'static Spec> {
+    let typed = typed.trim_start();
+    if typed.contains(' ') {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|spec| spec.name.starts_with(typed))
+        .collect()
+}
+
+/// A link being opened (`:open`, pasted, or `tuitok LINK`), or why the last
+/// one couldn't be: said on the status line, a failure until the next key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkState {
+    Opening,
+    Failed(String),
+}
+
 pub struct App {
     pub colors: Colors,
     /// The theme in use (its id in `theme::BUILT_IN`), the data folder
@@ -220,6 +275,13 @@ pub struct App {
     /// picked on the command line `/` opens; and that while it's open.
     pub category: Option<Category>,
     pub search: Option<Search>,
+    /// The command line `:` opens, while it's open; the link being opened
+    /// (or why the last couldn't be), how many have been (each one's video
+    /// comes with its number), and the one `tuitok LINK` opens first.
+    pub command: Option<CommandLine>,
+    pub link: Option<LinkState>,
+    links_opened: u64,
+    first_link: Option<Link>,
     /// The guest Explore's pages are fetched as, once there is one (only in
     /// memory), and the category whose page is being fetched.
     explore_guest: Option<explore::Guest>,
@@ -338,6 +400,10 @@ impl App {
             size: crossterm::terminal::size().unwrap_or(GUESSED_SIZE),
             category: None,
             search: None,
+            command: None,
+            link: None,
+            links_opened: 0,
+            first_link: None,
             explore_guest: None,
             exploring: None,
             videos: Vec::new(),
@@ -408,7 +474,12 @@ impl App {
         }
         self.want_covers();
         self.want_comments();
-        self.fetch_more();
+        // `tuitok LINK`: its video first, then the feed (`on_opened`), so
+        // the feed's first doesn't play before it.
+        match self.first_link.take() {
+            Some(link) => self.open_link(link),
+            None => self.fetch_more(),
+        }
         let mut terminal_events = EventStream::new();
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, self))?;
@@ -529,6 +600,11 @@ impl App {
         app
     }
 
+    /// `tuitok LINK`: its video plays first, then the feed.
+    pub fn open_first(&mut self, link: Link) {
+        self.first_link = Some(link);
+    }
+
     /// Goes on from the last run's guest: its cookies for the first batch,
     /// and what it watched is skipped if TikTok sends it again.
     pub fn carry_in(&mut self, guest: crate::guest::Guest) {
@@ -575,8 +651,8 @@ impl App {
     }
 
     /// Whether that picture is in Pepper's box (not in mpv's window): not
-    /// while the `?` popup is open, or the categories' box where it's over
-    /// the video, which they'd cover (as in tuitube).
+    /// while the `?` popup is open, or a box over the bottom line where it's
+    /// over the video, which they'd cover (as in tuitube).
     pub fn picture_in_box(&self) -> bool {
         self.shows_picture()
             && self.token.is_some()
@@ -584,11 +660,19 @@ impl App {
             && !self.offers_cover_video()
     }
 
-    /// Whether the categories' box (`/`) is open over the video's side: it
-    /// goes over the panel, so the video plays on beside it, but where
-    /// there's no panel (a narrow window, or `f`) it's over the video.
+    /// Whether a box over the bottom line (`/`'s categories, `:`'s commands)
+    /// is open over the video's side: it goes over the panel, so the video
+    /// plays on beside it, but where there's no panel (a narrow window, or
+    /// `f`) it's over the video.
     pub fn offers_cover_video(&self) -> bool {
-        self.search.is_some() && self.areas().panel.is_none()
+        (self.search.is_some() || !self.command_offers().is_empty()) && self.areas().panel.is_none()
+    }
+
+    /// The commands `:`'s box offers, while it's open.
+    pub fn command_offers(&self) -> Vec<&'static Spec> {
+        self.command
+            .as_ref()
+            .map_or_else(Vec::new, |line| completions(&line.text))
     }
 
     /// Whether the player was told to play the video shown and has no
@@ -714,6 +798,10 @@ impl App {
                 self.want_comments();
                 self.play_current();
             }
+            AppEvent::Opened { number, video } if number == self.links_opened => {
+                self.on_opened(video);
+            }
+            AppEvent::Opened { .. } => {}
             AppEvent::Rested => self.refill(),
             // What comes for a video no longer waited for (of a feed no
             // longer shown) is dropped.
@@ -895,6 +983,88 @@ impl App {
                 self.rest();
             }
         }
+    }
+
+    /// Opens `link`: its video is fetched (no browser: `links::fetch`), then
+    /// shown next ([`App::on_opened`]). A link opened meanwhile takes its
+    /// place.
+    fn open_link(&mut self, link: Link) {
+        if self.demo {
+            self.link = Some(LinkState::Failed("The demo opens no links".into()));
+            return;
+        }
+        self.links_opened += 1;
+        self.link = Some(LinkState::Opening);
+        let (Some(client), Some(tx)) = (self.www_client.clone(), self.tx.clone()) else {
+            return;
+        };
+        let number = self.links_opened;
+        tokio::spawn(async move {
+            let video = links::fetch(&client, link)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::Opened { number, video });
+        });
+    }
+
+    /// The video a link is to came: it's shown next. Or it didn't, and the
+    /// status line says why. Then the feed is fetched if it wants more
+    /// (after `tuitok LINK`, it waited for this).
+    fn on_opened(&mut self, video: Result<Video, String>) {
+        match video {
+            Ok(video) => {
+                self.link = None;
+                self.show_next(video);
+            }
+            Err(e) => {
+                let why = text::one_line(&e, 300);
+                self.link = Some(LinkState::Failed(format!("The link failed: {why}")));
+            }
+        }
+        self.refill();
+    }
+
+    /// Shows `video` where `j` goes from the one shown, so `k` goes back to
+    /// it and `j` goes on with the feed. One the feed has already is gone
+    /// back to if it's behind, else moved there, so the videos between it
+    /// and the one shown aren't skipped (and counted as watched). It's shown
+    /// even if it was watched before (it was asked for), and the feed
+    /// doesn't send it again.
+    fn show_next(&mut self, video: Video) {
+        match self.videos.iter().position(|v| v.id == video.id) {
+            Some(at) if at <= self.at => {
+                self.go(at as isize - self.at as isize);
+                return;
+            }
+            Some(at) => {
+                self.videos.remove(at);
+                if at < self.batch_from {
+                    self.batch_from -= 1;
+                }
+                if at <= self.furthest {
+                    self.furthest -= 1;
+                }
+            }
+            None => {
+                self.seen.insert(video.id.clone());
+                // Watched before (in a run or a feed before): watched again
+                // now, and kept once (`carry_out`).
+                self.watched_before.retain(|id| *id != video.id);
+            }
+        }
+        let to = if self.videos.is_empty() {
+            0
+        } else {
+            self.at + 1
+        };
+        // The furthest shown stays the same video.
+        if !self.videos.is_empty() && to <= self.furthest {
+            self.furthest += 1;
+        }
+        self.videos.insert(to, video);
+        // Not the batch's: its count (`found_so_far`) leaves it out.
+        self.batch_from += 1;
+        self.go(to as isize - self.at as isize);
     }
 
     /// A fetch failed, or brought nothing new: the next waits `RETRY_AFTER`,
@@ -1439,7 +1609,37 @@ impl App {
                 self.size = (columns, rows);
                 self.want_covers();
             }
+            // A paste, whole (`main` asks the terminal for bracketed ones).
+            Event::Paste(pasted) => self.on_paste(&pasted),
             _ => {}
+        }
+    }
+
+    /// A paste, as tuitube takes one: into the command line open (`:` or
+    /// `/`), as one line; with neither, a TikTok link opens. Not while the
+    /// `?` popup is open.
+    fn on_paste(&mut self, pasted: &str) {
+        let shown = self.category;
+        if self.help.is_some() {
+            return;
+        }
+        if let Some(line) = self.command.as_mut() {
+            paste_into(&mut line.text, pasted, MAX_COMMAND);
+            line.error = None;
+        } else if let Some(search) = self.search.as_mut() {
+            paste_into(&mut search.text, pasted, MAX_SEARCH);
+            let offered = explore::matching(&search.text);
+            search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+        } else {
+            match links::parse(text::first_chars(pasted, links::MAX_LINK + 1)) {
+                Some(link) => self.open_link(link),
+                // Not over a link still being opened.
+                None if self.link != Some(LinkState::Opening) => {
+                    let why = "What was pasted isn't a TikTok video's link";
+                    self.link = Some(LinkState::Failed(why.into()));
+                }
+                None => {}
+            }
         }
     }
 
@@ -1448,12 +1648,20 @@ impl App {
             self.quit = true;
             return;
         }
+        // Why a link failed is said until the next key, typed in a line too.
+        if matches!(self.link, Some(LinkState::Failed(_))) {
+            self.link = None;
+        }
         if self.help.is_some() {
             self.on_help_key(key);
             return;
         }
         if self.search.is_some() {
             self.on_search_key(key);
+            return;
+        }
+        if self.command.is_some() {
+            self.on_command_key(key);
             return;
         }
         match key.code {
@@ -1469,6 +1677,7 @@ impl App {
             KeyCode::Char('f') => self.toggle_fullscreen(),
             KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('/') => self.open_search(),
+            KeyCode::Char(':') => self.command = Some(CommandLine::default()),
             KeyCode::Char('r') => {
                 self.failed_at = None;
                 self.fetch_more();
@@ -1580,31 +1789,71 @@ impl App {
             KeyCode::Char('n') if ctrl => search.selected = (search.selected + 1).min(last),
             KeyCode::Up | KeyCode::BackTab => search.selected = search.selected.saturating_sub(1),
             KeyCode::Char('p') if ctrl => search.selected = search.selected.saturating_sub(1),
-            KeyCode::Backspace => {
-                search.text.pop();
+            _ => {
+                edit_line(&mut search.text, key, MAX_SEARCH);
             }
-            KeyCode::Char('h') if ctrl => {
-                search.text.pop();
-            }
-            KeyCode::Char('u') if ctrl => search.text.clear(),
-            KeyCode::Char('w') if ctrl => {
-                let kept = search.text.trim_end().len();
-                search.text.truncate(kept);
-                let cut = search.text.rfind(' ').map_or(0, |i| i + 1);
-                search.text.truncate(cut);
-            }
-            KeyCode::Char(c)
-                if !ctrl && !text::is_hidden(c) && search.text.chars().count() < MAX_SEARCH =>
-            {
-                search.text.push(c);
-            }
-            _ => {}
         }
         if let Some(search) = self.search.as_mut()
             && search.text != typed
         {
             let offered = explore::matching(&search.text);
             search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+        }
+    }
+
+    /// Keys while the command line `:` is open, as tuitube's: Tab completes
+    /// the command its box offers, Enter runs the line, Esc closes it;
+    /// typing and rubbing out as on `/`'s.
+    fn on_command_key(&mut self, key: KeyEvent) {
+        let Some(line) = self.command.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.command = None,
+            KeyCode::Enter => self.run_command(),
+            KeyCode::Tab => {
+                if let Some(spec) = completions(&line.text).first() {
+                    line.text = format!("{} ", spec.name);
+                    line.error = None;
+                }
+            }
+            _ => {
+                if edit_line(&mut line.text, key, MAX_COMMAND) {
+                    line.error = None;
+                }
+            }
+        }
+    }
+
+    /// Enter on the command line: `open LINK` (or `o LINK`, or a link
+    /// alone) closes it and opens the link, an empty line just closes it;
+    /// any other stays, saying why, as tuitube's (never quoting it).
+    fn run_command(&mut self) {
+        let Some(line) = self.command.as_mut() else {
+            return;
+        };
+        let text = line.text.trim();
+        let (name, arg) = text
+            .split_once(' ')
+            .map_or((text, ""), |(name, arg)| (name, arg.trim()));
+        let link = match name {
+            "" => Ok(None),
+            "open" | "o" if arg.is_empty() => Err("open needs a link"),
+            "open" | "o" => links::parse(arg)
+                .map(Some)
+                .ok_or("Not a TikTok video's link"),
+            _ => links::parse(text)
+                .map(Some)
+                .ok_or("No such command: open <link>"),
+        };
+        match link {
+            Ok(link) => {
+                self.command = None;
+                if let Some(link) = link {
+                    self.open_link(link);
+                }
+            }
+            Err(why) => line.error = Some(why.into()),
         }
     }
 
@@ -1734,6 +1983,51 @@ impl App {
         let resting = self.failed_at.is_some_and(|at| at.elapsed() < RETRY_AFTER);
         (left <= REFILL_AT || growing) && !resting
     }
+}
+
+/// A key on a line being typed (`/`'s or `:`'s), as in a shell: Backspace
+/// (or Ctrl-h) rubs out a character, Ctrl-w a word, Ctrl-u the line; a
+/// character is typed unless it's hidden (`text::is_hidden`) or the line
+/// has `max`. Whether the key was one of these.
+fn edit_line(text: &mut String, key: KeyEvent, max: usize) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        KeyCode::Char('h') if ctrl => {
+            text.pop();
+        }
+        KeyCode::Char('u') if ctrl => text.clear(),
+        KeyCode::Char('w') if ctrl => {
+            let kept = text.trim_end().len();
+            text.truncate(kept);
+            let cut = text.rfind(' ').map_or(0, |i| i + 1);
+            text.truncate(cut);
+        }
+        KeyCode::Char(c) if !ctrl && !text::is_hidden(c) && text.chars().count() < max => {
+            text.push(c);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// `pasted` added to a line being typed, as one line (`text::one_line`),
+/// up to `max` characters in all.
+fn paste_into(line: &mut String, pasted: &str, max: usize) {
+    // A paste can be any size: cut before it's cleaned.
+    let pasted = text::first_chars(pasted, 4 * max);
+    // A space it starts with stays, so it isn't run into the word before.
+    if pasted.starts_with(char::is_whitespace)
+        && !line.is_empty()
+        && !line.ends_with(' ')
+        && line.chars().count() < max
+    {
+        line.push(' ');
+    }
+    let room = max.saturating_sub(line.chars().count());
+    line.push_str(&text::one_line(pasted, room));
 }
 
 /// Writes tuitok's own sequences to the terminal, after ratatui's frame.
@@ -2537,5 +2831,220 @@ pub mod tests {
         );
         said(&mut app, PlayerEvent::Exited);
         assert!(app.loaded.is_none() && app.token.is_none() && app.player_gone);
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn colon_opens_the_command_line_and_open_takes_a_link() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        set_playing(&mut app, "1", true);
+        press(&mut app, KeyCode::Char(':'));
+        assert_eq!(app.command, Some(CommandLine::default()));
+        assert_eq!(app.command_offers(), [&COMMANDS[0]]);
+        // Its box is over the panel: the video plays on beside it; with no
+        // panel, over the video, which is taken away.
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        app.size = (80, 40);
+        assert_eq!(app.placement(), pepper::remove("t0k"));
+        // While it's open, keys are typed: j doesn't move, q doesn't quit.
+        type_in(&mut app, "jq");
+        assert_eq!((app.at, app.quit), (0, false));
+        assert!(app.command_offers().is_empty());
+        let error = |app: &App| app.command.as_ref().unwrap().error.clone();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(error(&app).as_deref(), Some("No such command: open <link>"));
+        // Editing clears why; Tab completes the command, and its box goes.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(error(&app), None);
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.command.as_ref().unwrap().text, "open ");
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(error(&app).as_deref(), Some("open needs a link"));
+        type_in(
+            &mut app,
+            "https://www.tiktok.com/@x/photo/7657182246486478098",
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(error(&app).as_deref(), Some("Not a TikTok video's link"));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.command.as_ref().unwrap().text, "open ");
+        type_in(&mut app, "vt.tiktok.com/ZSe4FqkKd");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.command.is_none());
+        assert_eq!(
+            (app.link.clone(), app.links_opened),
+            (Some(LinkState::Opening), 1)
+        );
+        // A link alone opens too, `o` is `open`, and an empty line just
+        // closes.
+        for line in ["7657182246486478098", "o 7657182246486478098"] {
+            press(&mut app, KeyCode::Char(':'));
+            type_in(&mut app, line);
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.links_opened, 3);
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.command.is_none() && app.links_opened == 3);
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.command.is_none() && !app.quit);
+    }
+
+    #[test]
+    fn an_opened_video_plays_next_and_the_feed_goes_on_after_it() {
+        let mut app = app_with(["1", "2", "3"].map(crate::ui::tests::video).to_vec());
+        app.go(1);
+        // 3 is of the batch being fetched.
+        app.batch_from = 2;
+        let open = |app: &mut App, id: &str| {
+            app.open_link(Link::Video(VideoId::new(id).unwrap()));
+            let number = app.links_opened;
+            app.on_app_event(AppEvent::Opened {
+                number,
+                video: Ok(crate::ui::tests::video(id)),
+            });
+        };
+        app.open_link(Link::Video(VideoId::new("9").unwrap()));
+        assert_eq!(app.link, Some(LinkState::Opening));
+        // A link opened before it: dropped.
+        app.on_app_event(AppEvent::Opened {
+            number: 0,
+            video: Ok(crate::ui::tests::video("8")),
+        });
+        assert_eq!(ids(&app), ["1", "2", "3"]);
+        app.on_app_event(AppEvent::Opened {
+            number: 1,
+            video: Ok(crate::ui::tests::video("9")),
+        });
+        assert_eq!(ids(&app), ["1", "2", "9", "3"]);
+        assert_eq!((app.at, app.found_so_far(), app.link.clone()), (2, 1, None));
+        // The feed doesn't send it again, and it counts as watched.
+        app.add(vec![crate::ui::tests::video("9")]);
+        assert_eq!(app.videos.len(), 4);
+        let watched = |app: &App| -> Vec<String> {
+            let out = app.carry_out().watched;
+            out.iter().map(|id| id.as_str().to_owned()).collect()
+        };
+        assert_eq!(watched(&app), ["1", "2", "9"]);
+        // One in the feed already is gone back to, not added again.
+        open(&mut app, "1");
+        assert_eq!((app.videos.len(), app.at), (4, 0));
+        // Gone back, one goes after the video shown; the furthest shown
+        // stays the same video.
+        open(&mut app, "7");
+        assert_eq!(ids(&app), ["1", "7", "2", "9", "3"]);
+        assert_eq!(app.at, 1);
+        assert_eq!(watched(&app), ["1", "7", "2", "9"]);
+        // One ahead is moved after the video shown: the ones between it and
+        // the one shown aren't skipped, nor counted as watched.
+        let mut ahead = app_with(
+            ["1", "2", "3", "4", "5"]
+                .map(crate::ui::tests::video)
+                .to_vec(),
+        );
+        open(&mut ahead, "4");
+        assert_eq!(ids(&ahead), ["1", "4", "2", "3", "5"]);
+        assert_eq!(
+            (ahead.at, watched(&ahead)),
+            (1, vec!["1".into(), "4".into()])
+        );
+        // One that fails says why, until the next key, typed in a line too.
+        app.open_link(Link::Video(VideoId::new("6").unwrap()));
+        app.on_app_event(AppEvent::Opened {
+            number: app.links_opened,
+            video: Err("the video is private".into()),
+        });
+        let failed = "The link failed: the video is private";
+        assert_eq!(app.link, Some(LinkState::Failed(failed.into())));
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.link, None);
+    }
+
+    #[test]
+    fn a_link_s_video_comes_first_in_an_empty_feed() {
+        let mut app = app_with(Vec::new());
+        app.open_first(Link::Video(VideoId::new("9").unwrap()));
+        let link = app.first_link.take().unwrap();
+        app.open_link(link);
+        app.on_app_event(AppEvent::Opened {
+            number: 1,
+            video: Ok(crate::ui::tests::video("9")),
+        });
+        assert_eq!((ids(&app), app.at, app.found_so_far()), (vec!["9"], 0, 0));
+        app.on_app_event(AppEvent::Found(
+            ["1", "2"].map(crate::ui::tests::video).to_vec(),
+        ));
+        assert_eq!((ids(&app), app.found_so_far()), (vec!["9", "1", "2"], 2));
+        // A link to a video watched in a run before: it plays, and is kept
+        // as watched once.
+        let mut app = app_with(Vec::new());
+        app.carry_in(crate::guest::Guest {
+            cookies: Vec::new(),
+            watched: vec![VideoId::new("9").unwrap(), VideoId::new("8").unwrap()],
+        });
+        app.open_link(Link::Video(VideoId::new("9").unwrap()));
+        app.on_app_event(AppEvent::Opened {
+            number: 1,
+            video: Ok(crate::ui::tests::video("9")),
+        });
+        assert_eq!(ids(&app), ["9"]);
+        let watched = app.carry_out().watched;
+        let watched: Vec<&str> = watched.iter().map(VideoId::as_str).collect();
+        assert_eq!(watched, ["8", "9"]);
+    }
+
+    #[test]
+    fn a_paste_goes_into_the_line_open_else_a_link_opens() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        let paste = |app: &mut App, text: &str| app.on_event(Event::Paste(text.into()));
+        // Nothing open: a link opens; anything else is said not to be one,
+        // but not over a link still being opened.
+        paste(&mut app, "hello there");
+        assert!(matches!(app.link, Some(LinkState::Failed(_))));
+        paste(&mut app, "https://vt.tiktok.com/ZSe4FqkKd\n");
+        assert_eq!(
+            (app.link.clone(), app.links_opened),
+            (Some(LinkState::Opening), 1)
+        );
+        paste(&mut app, "hello there");
+        assert_eq!(app.link, Some(LinkState::Opening));
+        assert_eq!(app.links_opened, 1);
+        // Into the command line, as one line, cleaned and capped; a space
+        // it starts with stays.
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "open");
+        paste(&mut app, " a\nb\u{1b}c");
+        assert_eq!(app.command.as_ref().unwrap().text, "open a bc");
+        paste(&mut app, &"x".repeat(3 * MAX_COMMAND));
+        assert_eq!(app.command.as_ref().unwrap().text.len(), MAX_COMMAND);
+        press(&mut app, KeyCode::Esc);
+        // Into `/`'s, narrowing it.
+        press(&mut app, KeyCode::Char('/'));
+        paste(&mut app, "foo");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.text, "foo");
+        assert_eq!(
+            explore::name(explore::matching("foo")[search.selected]),
+            "Food"
+        );
+        press(&mut app, KeyCode::Esc);
+        // Not while the popup is open.
+        press(&mut app, KeyCode::Char('?'));
+        paste(&mut app, "7657182246486478098");
+        assert_eq!(app.links_opened, 1);
+        // The demo opens none.
+        let mut demo = App::demo(false);
+        paste(&mut demo, "7657182246486478098");
+        let none = "The demo opens no links";
+        assert_eq!(demo.link, Some(LinkState::Failed(none.into())));
     }
 }

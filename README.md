@@ -29,6 +29,7 @@ Made for [Pepper](https://github.com/erictran308/pepper), the terminal that play
 
 - **For You, one at a time.** The video upright in its own box, its cover while it loads, and beside it the author, caption, sound, plays, likes, comments and shares, where it's at with a bar of how far, and its top comments. Each video loops, as on TikTok.
 - **Or a category.** `/` opens a command line at the bottom, as tuitube's `:` does: type to narrow For You and Explore's 21 categories (Comedy, Food, Animals, Sports…), `enter`, and that's what plays. A category needs no browser: its first videos come in a second or two. (TikTok's keyword search needs an account, so tuitok has none.)
+- **Or a link.** Paste a TikTok video's link, type `:open` and the link, or start `tuitok LINK`, and that video plays next, in about a second, with no browser: `k` goes back to where you were, `j` on with the feed. Short links (`vt.tiktok.com/…`) work too.
 - **Inside the terminal, in Pepper.** In a [Pepper](#made-for-pepper) tab the video plays in its box, in the same tab as your shell, straight from the graphics chip; `f` fills the tab with it. In any other terminal it plays in mpv's window, with its cover in the box.
 - **Plays in about 2.5 seconds.** The first batch is a single video, then they grow 2, 3, 5, 8 and 13, one after another, each video handed on as soon as TikTok's page has it. The next three are downloaded while you watch, so `j` plays the next one straight away.
 - **Top comments, as TikTok ranks them.** Up to ten, as many as fit, with their likes, under the counts: fetched for the video you're on and the next, from TikTok's comment list, with no cookie.
@@ -92,7 +93,7 @@ tuitok --check    # what it found: Pepper, its player, a browser, mpv
 tuitok
 ```
 
-`tuitok --demo` shows the screen with made-up videos, fetching and playing nothing. `tuitok --feed` fetches one batch and lists it. `tuitok --forget` forgets the last run's guest and what you watched. tuitok runs on macOS, and on Linux without Pepper (in mpv's window).
+`tuitok https://www.tiktok.com/@…/video/…` plays that video first, then For You. `tuitok --demo` shows the screen with made-up videos, fetching and playing nothing. `tuitok --feed` fetches one batch and lists it. `tuitok --forget` forgets the last run's guest and what you watched. tuitok runs on macOS, and on Linux without Pepper (in mpv's window).
 
 ## Keys
 
@@ -101,6 +102,7 @@ tuitok
 | `j` or `↓` | the next video |
 | `k` or `↑` | the one before |
 | `/` | For You, or one of Explore's 21 categories: type to narrow, `↑` `↓`, `enter` |
+| `:` | a command: `open <link>` plays a TikTok link (`tab` completes `open`); pasting a link does the same |
 | `space` | pause |
 | `m` | mute |
 | `-` `+` | volume down or up (kept for next time) |
@@ -118,13 +120,14 @@ tuitok
 4. **Playing.** In Pepper, through `pepper-play` into the box; elsewhere, in mpv's window. One player for the whole run, driven over a private socket.
 5. **Covers and comments.** Fetched straight from TikTok for the video you're on and the next ones, and kept in memory.
 6. **Categories.** Explore's videos answer a plain request, so a category needs no browser: one visit to TikTok's Explore page makes a guest, then each page of about 15 videos takes under a second, the next fetched as you near the end.
+7. **Links.** A video's page answers a plain request too: tuitok reads the video from it, with the guest cookie the page sets, kept in memory only. A short link is one redirect, read but not followed.
 
 ## Privacy and security
 
 - **No account.** tuitok never logs in. The feed is TikTok's logged-out For You: popular videos for your country, not yours.
 - **Little kept.** One small file, readable only by you, carries the guest from one run to the next: TikTok's guest cookies and the ids of the videos you watched (the newest 5,000), nothing else. `tuitok --forget` deletes it. Your theme and volume are kept in another, `settings.toml`. Videos are downloaded into a folder of that run's only, readable only by you, and it's deleted when tuitok quits (or by the next run, if it crashed); covers and comments stay in memory.
 - **The browser runs only while it fetches**, with a profile of that run's, pictures, video and sound refused, and Lightpanda's telemetry off.
-- **Only TikTok's own hosts** are fetched from, over https; redirects elsewhere are refused. Top comments come from TikTok's comment list, asked without any cookie; a category's videos with the guest cookie TikTok's Explore page gave, kept in memory only. What you type in the bar only narrows its list: it's never sent anywhere. Text from TikTok is cleaned before it's shown, pictures are decoded only as JPEG within size limits, and downloaded videos must be MP4s.
+- **Only TikTok's own hosts** are fetched from, over https; redirects elsewhere are refused. Top comments come from TikTok's comment list, asked without any cookie; a category's videos with the guest cookie TikTok's Explore page gave, kept in memory only. What you type in the bar only narrows its list: it's never sent anywhere. A link opens only if it's TikTok's: tuitok keeps the video's id and fetches its page from that, never the link itself. Text from TikTok is cleaned before it's shown, pictures are decoded only as JPEG within size limits, and downloaded videos must be MP4s.
 - **Nothing private on a command line.** The guest's cookies go only to the next batch's browser and to that file, and the one the videos need goes to the player only over its private socket. Read back, the file is checked as if TikTok had just sent it.
 
 ## Disclaimer

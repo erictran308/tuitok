@@ -4,8 +4,9 @@
 //! the feed's state on the bottom line. Until a video plays in Pepper's box,
 //! the box shows its cover, with under it what plays and how it's going.
 //! `/` opens a command line on the bottom line, as tuitube's `:`, with For
-//! You and Explore's categories in a box over it; `?` a popup over it all:
-//! every key, and the settings.
+//! You and Explore's categories in a box over it; `:` one that runs `open
+//! <link>`, its command in a box over it while it's typed; `?` a popup over
+//! it all: every key, and the settings.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -16,12 +17,13 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::app::{App, FeedState, HelpMenu, HelpTab, Search};
+use crate::app::{App, FeedState, HelpMenu, HelpTab, LinkState, Search, Spec};
 use crate::cache::Download;
 use crate::comments::Comments;
 use crate::covers::Cover;
 use crate::explore;
 use crate::pepper;
+use crate::text;
 use crate::theme;
 use crate::video::{Video, VideoId};
 
@@ -124,13 +126,37 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(panel) = areas.panel {
         draw_panel(frame, app, panel);
     }
-    match &app.search {
-        // `/`: the command line takes the bottom line, its categories over it.
-        Some(search) => {
-            command_line(frame, app, search, areas.bottom);
-            draw_offers(frame, app, search, areas.bottom, areas.panel);
-        }
-        None => draw_bottom(frame, app, areas.bottom),
+    // `/` and `:`: the command line takes the bottom line, what it offers
+    // over it.
+    if let Some(search) = &app.search {
+        let right = if explore::matching(&search.text).is_empty() {
+            vec![Span::from("No category matches ").fg(c.dim)]
+        } else {
+            line_keys(c, &[("↑↓", "move"), ("Enter", "show"), ("Esc", "close")])
+        };
+        command_line(frame, app, "/", &search.text, right, areas.bottom);
+        draw_offers(frame, app, search, areas.bottom, areas.panel);
+    } else if let Some(line) = &app.command {
+        let right = match &line.error {
+            // Cut to fit, not left out: Enter would seem to do nothing.
+            Some(error) => {
+                let room = usize::from(areas.bottom.width / 2).saturating_sub(2);
+                let error = if error.chars().count() > room {
+                    format!("{}…", text::first_chars(error, room.saturating_sub(1)))
+                } else {
+                    error.clone()
+                };
+                vec![Span::from(format!(" {error} ")).fg(c.red)]
+            }
+            None => line_keys(
+                c,
+                &[("Tab", "complete"), ("Enter", "run"), ("Esc", "close")],
+            ),
+        };
+        command_line(frame, app, ":", &line.text, right, areas.bottom);
+        draw_commands(frame, app, areas.bottom, areas.panel);
+    } else {
+        draw_bottom(frame, app, areas.bottom);
     }
     if let Some(menu) = &app.help {
         draw_help(frame, app, menu, area);
@@ -182,6 +208,7 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {
             let why = match app.feed {
+                _ if app.link == Some(LinkState::Opening) => "Opening the link…".to_owned(),
                 FeedState::Fetching(_) => "Fetching the feed…".to_owned(),
                 FeedState::Exploring => format!("Fetching {}…", app.feed_name()),
                 _ => "No videos yet".to_owned(),
@@ -349,35 +376,28 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The command line `/` opens on the bottom line, as tuitube's `:` (vim's):
-/// `/` and what's typed, then its keys on the right, or that nothing
-/// matches.
-fn command_line(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
+/// A command line on the bottom line, as tuitube's `:` (vim's): `prompt`
+/// (`/` or `:`) and what's `typed`, then on the right its keys, or why
+/// not; those only if they take at most half the line.
+fn command_line(
+    frame: &mut Frame,
+    app: &App,
+    prompt: &'static str,
+    typed: &str,
+    mut right: Vec<Span<'static>>,
+    area: Rect,
+) {
     let c = &app.colors;
     let width = usize::from(area.width);
-    let mut right = Vec::new();
-    if explore::matching(&search.text).is_empty() {
-        right.push(Span::from("No category matches ").fg(c.dim));
-    } else {
-        for (n, (key, what)) in [("↑↓", "move"), ("Enter", "show"), ("Esc", "close")]
-            .into_iter()
-            .enumerate()
-        {
-            right.push(Span::from(if n == 0 { " " } else { " · " }).fg(c.dim));
-            right.push(Span::from(key).fg(c.accent));
-            right.push(Span::from(format!(" {what}")).fg(c.dim));
-        }
-        right.push(Span::raw(" "));
-    }
     let mut right_width: usize = right.iter().map(Span::width).sum();
     if right_width > width / 2 {
         right.clear();
         right_width = 0;
     }
-    let typed = tail(&search.text, width.saturating_sub(right_width + 2));
+    let typed = tail(typed, width.saturating_sub(right_width + 2));
     let used = 2 + Span::raw(typed.to_owned()).width();
     let mut spans = vec![
-        Span::from("/").fg(c.accent).bold(),
+        Span::from(prompt).fg(c.accent).bold(),
         Span::from(typed.to_owned()).fg(c.text),
         Span::from("▏").fg(c.accent),
         Span::raw(" ".repeat(width.saturating_sub(used + right_width))),
@@ -387,6 +407,18 @@ fn command_line(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
         Paragraph::new(Line::from(spans)).style(Style::new().bg(c.bg)),
         area,
     );
+}
+
+/// Keys and what each does, as a command line shows them on its right.
+fn line_keys(c: &theme::Colors, keys: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (n, (key, what)) in keys.iter().enumerate() {
+        spans.push(Span::from(if n == 0 { " " } else { " · " }).fg(c.dim));
+        spans.push(Span::from(*key).fg(c.accent));
+        spans.push(Span::from(format!(" {what}")).fg(c.dim));
+    }
+    spans.push(Span::raw(" "));
+    spans
 }
 
 /// The end of `text` that fits in `width` columns.
@@ -411,11 +443,7 @@ fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, pane
     const TITLE: &str = " Categories ";
     let c = &app.colors;
     let offered = explore::matching(&search.text);
-    // Room over the command line, less the box's borders.
-    let rows = offered
-        .len()
-        .min(MAX_OFFERS)
-        .min(usize::from(bottom.y).saturating_sub(2));
+    let rows = rows_over(bottom, offered.len());
     if rows == 0 {
         return;
     }
@@ -428,12 +456,8 @@ fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, pane
         .unwrap_or(0);
     // The border, the bar, the mark, the name, a space and the border.
     let fits = (names + 6).max(TITLE.len() + 4) as u16;
-    let (x, width) = match panel {
-        Some(panel) => (panel.x, panel.width),
-        None => (bottom.x, fits.min(bottom.width)),
-    };
-    let height = rows as u16 + 2;
-    let popup = Rect::new(x, bottom.y - height, width, height);
+    let popup = box_over_line(frame, app, TITLE, rows, fits, bottom, panel);
+    let inner = popup.inner(Margin::new(1, 1));
     // As little scrolled as keeps the cursor in view.
     let lit = search.selected;
     let mut scroll = search.scroll.get().min(lit);
@@ -441,14 +465,6 @@ fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, pane
         scroll = lit + 1 - rows;
     }
     search.scroll.set(scroll);
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(c.accent))
-        .title(Span::from(TITLE).fg(c.text).bold())
-        .style(Style::new().bg(c.panel));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
     let lines: Vec<Line> = offered
         .iter()
         .enumerate()
@@ -494,14 +510,104 @@ fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, pane
     }
 }
 
+/// What `:` offers while its command is typed, as tuitube's completions:
+/// each command with its argument and what it does, in a box over the
+/// command line as `/`'s, the one Tab completes lit.
+fn draw_commands(frame: &mut Frame, app: &App, bottom: Rect, panel: Option<Rect>) {
+    const TITLE: &str = " Commands ";
+    let c = &app.colors;
+    let offered = app.command_offers();
+    let rows = rows_over(bottom, offered.len());
+    if rows == 0 {
+        return;
+    }
+    let name = |spec: &Spec| format!("{} {}", spec.name, spec.hint);
+    // ASCII: bytes are cells.
+    let names = offered.iter().map(|s| name(s).len()).max().unwrap_or(0);
+    let abouts = offered.iter().map(|s| s.about.len()).max().unwrap_or(0);
+    // The border, the bar, the mark's room, the name, two spaces, what it
+    // does, a space and the border.
+    let fits = (names + abouts + 8).max(TITLE.len() + 4) as u16;
+    let popup = box_over_line(frame, app, TITLE, rows, fits, bottom, panel);
+    let inner = popup.inner(Margin::new(1, 1));
+    let lines: Vec<Line> = offered
+        .iter()
+        .take(rows)
+        .enumerate()
+        .map(|(n, spec)| {
+            let chosen = n == 0;
+            let used = 3 + names + 2 + spec.about.len();
+            let row = Line::from(vec![
+                if chosen {
+                    Span::from("▌").fg(c.accent)
+                } else {
+                    Span::raw(" ")
+                },
+                Span::raw("  "),
+                Span::from(format!("{:<names$}", name(spec)))
+                    .fg(c.text)
+                    .bold(),
+                Span::raw("  "),
+                Span::from(spec.about).fg(c.subtext),
+                // To the box's edge, so the lit row is lit across.
+                Span::raw(" ".repeat(usize::from(inner.width).saturating_sub(used))),
+            ]);
+            if chosen {
+                row.style(Style::new().bg(c.selected))
+            } else {
+                row
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// How many of `want` rows a box over the command line (`bottom`) shows:
+/// `MAX_OFFERS` at most, and what fits above it with the box's borders.
+fn rows_over(bottom: Rect, want: usize) -> usize {
+    want.min(MAX_OFFERS)
+        .min(usize::from(bottom.y).saturating_sub(2))
+}
+
+/// Draws an empty box `rows` tall inside, titled `title`, over the command
+/// line (`bottom`): over the `panel`, as wide and on its bottom edge, so
+/// the video plays on beside it; with no panel, over the video's side,
+/// `fits` wide. Where it is.
+fn box_over_line(
+    frame: &mut Frame,
+    app: &App,
+    title: &'static str,
+    rows: usize,
+    fits: u16,
+    bottom: Rect,
+    panel: Option<Rect>,
+) -> Rect {
+    let c = &app.colors;
+    let (x, width) = match panel {
+        Some(panel) => (panel.x, panel.width),
+        None => (bottom.x, fits.min(bottom.width)),
+    };
+    let height = rows as u16 + 2;
+    let popup = Rect::new(x, bottom.y - height, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(c.accent))
+        .title(Span::from(title).fg(c.text).bold())
+        .style(Style::new().bg(c.panel));
+    frame.render_widget(block, popup);
+    popup
+}
+
 /// Every key, for the `?` popup's first tab.
-const KEYS: [(&str, &str); 10] = [
+const KEYS: [(&str, &str); 11] = [
     ("j  ↓", "the next video"),
     ("k  ↑", "the one before"),
     (
         "/",
         "For You, or one of Explore's categories: type, ↑ ↓, Enter",
     ),
+    (":", "open <link>: play a TikTok link (or just paste one)"),
     ("Space", "pause or play"),
     ("h l  ← →  , .", "back or on 5 s"),
     (
@@ -648,12 +754,13 @@ fn progress(app: &App, position: u32, length: u32, width: u16) -> Line<'static> 
     ])
 }
 
-/// The keys on the left, the feed's state on the right.
+/// The keys on the left, the feed's state on the right, two cells apart at
+/// least, as the keys are.
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     let status = status(app);
     let width = (status.width() as u16).min(area.width / 2);
     let [keys, right] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(width + 1)]).areas(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(width + 2)]).areas(area);
     frame.render_widget(Paragraph::new(hints(app, keys.width)), keys);
     frame.render_widget(Paragraph::new(status).alignment(Alignment::Right), right);
 }
@@ -666,6 +773,7 @@ fn hints(app: &App, width: u16) -> Line<'static> {
     let keys = [
         ("j k", "next/back"),
         ("/", "category"),
+        (":", "open"),
         ("space", "pause"),
         ("m", "mute"),
         ("?", "help"),
@@ -697,8 +805,14 @@ fn hints(app: &App, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The link being opened, or why it couldn't be; else the feed's state.
 fn status(app: &App) -> Line<'static> {
     let c = &app.colors;
+    match &app.link {
+        Some(LinkState::Opening) => return Line::from("Opening the link…").fg(c.dim),
+        Some(LinkState::Failed(why)) => return Line::from(why.clone()).fg(c.red),
+        None => {}
+    }
     match &app.feed {
         FeedState::NoBrowser => {
             Line::from("No browser for the feed: brew install lightpanda-io/browser/lightpanda")
@@ -836,12 +950,12 @@ pub mod tests {
         let last = text.lines().last().unwrap();
         // The status is long: the hints that don't fit are left out, but
         // not how to quit.
-        assert!(last.starts_with(" j k next/back  / category  space pause  m mute  q quit"));
+        assert!(last.starts_with(" j k next/back  / category  : open  space pause  q quit"));
         assert!(last.contains("No browser for the feed"));
         app.feed = FeedState::Failed("x".into());
         let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
         assert!(last.starts_with(
-            " j k next/back  / category  space pause  m mute  ? help  - + volume  f fill  q quit"
+            " j k next/back  / category  : open  space pause  m mute  ? help  - + volume  q quit"
         ));
     }
 
@@ -966,6 +1080,73 @@ pub mod tests {
                 .unwrap()
                 .starts_with("/▏ ")
         );
+    }
+
+    #[test]
+    fn colon_opens_a_command_line_with_its_command_over_it() {
+        use crate::app::CommandLine;
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        app.command = Some(CommandLine::default());
+        let text = screen(&app, 120, 40);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[39].starts_with(":▏ "), "{}", rows[39]);
+        assert!(
+            rows[39].ends_with(" Tab complete · Enter run · Esc close "),
+            "{}",
+            rows[39]
+        );
+        // Over it, on the panel's bottom edge and as wide, its command, lit.
+        let panel = |row: &str| row.chars().skip(72).collect::<String>();
+        assert!(panel(rows[36]).starts_with("╭ Commands ─"), "{}", rows[36]);
+        assert!(
+            panel(rows[37]).starts_with("│▌  open <link>  play a TikTok link "),
+            "{}",
+            rows[37]
+        );
+        assert_eq!(
+            bg_of(&app, (120, 40), "open <link>", 40),
+            app.colors.selected
+        );
+        // A narrow window: over the video's side, as wide as it needs.
+        let narrow = screen(&app, 80, 40);
+        let rows: Vec<&str> = narrow.lines().collect();
+        let top = format!("╭ Commands {}╮", "─".repeat(25));
+        assert!(rows[36].starts_with(&top), "{}", rows[36]);
+        assert!(rows[37].starts_with("│▌  open <link>  play a TikTok link │"));
+        // The command typed: no box; why a line didn't run, in its place.
+        app.command = Some(CommandLine {
+            text: "open x".into(),
+            error: Some("Not a TikTok video's link".into()),
+        });
+        let text = screen(&app, 120, 40);
+        assert!(!text.contains("Commands"));
+        let last = text.lines().last().unwrap();
+        assert!(last.starts_with(":open x▏ "), "{last}");
+        assert!(last.ends_with(" Not a TikTok video's link "), "{last}");
+        // A narrow window: cut to fit, never left out.
+        let narrow = screen(&app, 40, 40);
+        let last = narrow.lines().last().unwrap();
+        assert!(last.ends_with(" Not a TikTok vide… "), "{last}");
+        // A link being opened, or why it couldn't be, on the status line;
+        // with no videos yet, in the box too.
+        app.command = None;
+        app.link = Some(LinkState::Opening);
+        let text = screen(&app, 120, 40);
+        assert!(text.lines().last().unwrap().ends_with("Opening the link…"));
+        app.link = Some(LinkState::Failed(
+            "The link failed: the video is private".into(),
+        ));
+        let text = screen(&app, 120, 40);
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("The link failed: the video is private")
+        );
+        app.link = Some(LinkState::Opening);
+        app.videos.clear();
+        let text = screen(&app, 120, 40);
+        assert_eq!(text.matches("Opening the link…").count(), 2, "{text}");
     }
 
     /// The background `dx` cells after where `shown` starts on screen.

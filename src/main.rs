@@ -13,6 +13,7 @@ mod demo;
 mod explore;
 mod feed;
 mod guest;
+mod links;
 mod pepper;
 mod player;
 mod settings;
@@ -28,12 +29,14 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use browser::Engine;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 
 const HELP: &str = "\
 tuitok: TikTok's For You feed in the terminal, playing inside Pepper
 
-Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --forget | --help | --version]
+Usage: tuitok [LINK | --check | --feed [lightpanda | chrome] | --demo | --forget | --help | --version]
 
+  LINK        a TikTok video's link (or its id) to play first, then For You
   --check     say what tuitok found: Pepper, its player, a browser for the feed
   --feed      fetch one batch of the feed and list it: with Lightpanda, else
               Chrome, or with the one named (as a new guest)
@@ -44,9 +47,10 @@ Usage: tuitok [--check | --feed [lightpanda | chrome] | --demo | --forget | --he
   --version   print tuitok's version
 
 Keys: j or ↓ the next video, k or ↑ the one before, / For You or one of
-Explore's categories, space pause, m mute, - and + the volume down and up,
-h, ← or , and l, → or . back and on 5 s, f fill the tab, ? every key and
-the settings (the theme), r fetch more, q quit.
+Explore's categories, : open <link> plays a TikTok link (or paste one),
+space pause, m mute, - and + the volume down and up, h, ← or , and l, → or
+. back and on 5 s, f fill the tab, ? every key and the settings (the
+theme), r fetch more, q quit.
 
 tuitok isn't made or endorsed by TikTok or ByteDance.";
 
@@ -75,7 +79,7 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [] => run(),
+        [] => run(None),
         ["--check"] => {
             check();
             ExitCode::SUCCESS
@@ -92,12 +96,19 @@ fn main() -> ExitCode {
             println!("tuitok {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        // What was typed isn't repeated: it could hold escape sequences.
-        _ => {
-            eprintln!("tuitok: unknown arguments (tuitok --help)");
-            ExitCode::from(2)
-        }
+        [link] => match links::parse(link) {
+            Some(link) => run(Some(link)),
+            None => unknown_arguments(),
+        },
+        _ => unknown_arguments(),
     }
+}
+
+/// Arguments tuitok doesn't take. What was typed isn't repeated: it could
+/// hold escape sequences.
+fn unknown_arguments() -> ExitCode {
+    eprintln!("tuitok: unknown arguments (tuitok --help)");
+    ExitCode::from(2)
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -123,7 +134,8 @@ fn ended(result: std::io::Result<()>) -> ExitCode {
     }
 }
 
-fn run() -> ExitCode {
+/// A run, playing `first`'s video first if it's given (`tuitok LINK`).
+fn run(first: Option<links::Link>) -> ExitCode {
     let session = match config::Session::start() {
         Ok(session) => session,
         Err(e) => return fail(&e),
@@ -146,9 +158,13 @@ fn run() -> ExitCode {
     // watched isn't shown again.
     app.carry_in(guest::load(&session.data));
     app.use_settings(settings::load(&session.data), Some(session.data.clone()));
+    if let Some(link) = first {
+        app.open_first(link);
+    }
     let mut terminal = ratatui::init();
     start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));
+    bracketed_paste(false);
     ratatui::restore();
     tmux::restore();
     // A batch still being fetched and the downloads end here, the browser
@@ -185,13 +201,15 @@ fn run_demo() -> ExitCode {
     let mut terminal = ratatui::init();
     start_screen(&mut app);
     let result = runtime.block_on(app.run(&mut terminal));
+    bracketed_paste(false);
     ratatui::restore();
     tmux::restore();
     ended(result)
 }
 
 /// Once the terminal is set up and before keys are read: how it draws
-/// pictures (`covers::picker` asks it), and a panic hook. A picture
+/// pictures (`covers::picker` asks it), pastes whole (a link pasted isn't
+/// taken for keys), and a panic hook. A picture
 /// decoder's caught panic passes without tearing the screen down. Another
 /// task's would leave tuitok drawing on a terminal put back to normal
 /// (tokio catches it and the event loop goes on), so the screen stays and
@@ -203,6 +221,7 @@ fn start_screen(app: &mut app::App) {
     tmux::save();
     app.set_picker(covers::picker());
     app.behind_multiplexer = pepper::behind_multiplexer();
+    bracketed_paste(true);
     let restore = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if covers::panic_is_contained() {
@@ -214,9 +233,20 @@ fn start_screen(app: &mut app::App) {
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
             return;
         }
+        bracketed_paste(false);
         tmux::restore();
         restore(info);
     }));
+}
+
+/// Asks the terminal to send pastes whole (bracketed), or not any more.
+fn bracketed_paste(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = if on {
+        crossterm::execute!(out, EnableBracketedPaste)
+    } else {
+        crossterm::execute!(out, DisableBracketedPaste)
+    };
 }
 
 /// `--check`: what tuitok found, and where.
