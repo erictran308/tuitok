@@ -8,6 +8,12 @@ use std::sync::LazyLock;
 use ratatui::style::Color;
 use serde::Deserialize;
 
+/// True white and black, as exact colors (`Color::White` and `Color::Black`
+/// are the palette's, which themes paint as they like, and an animation
+/// can't blend): the logo's badge, Pepper's box, the splash screen's logo.
+pub const WHITE: Color = Color::Rgb(255, 255, 255);
+pub const BLACK: Color = Color::Rgb(0, 0, 0);
+
 /// The theme used when the settings name none, or one that isn't built in.
 pub const DEFAULT: &str = "mocha";
 

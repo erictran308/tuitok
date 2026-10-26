@@ -8,6 +8,8 @@
 //! <link>`, its command in a box over it while it's typed; `?` a popup over
 //! it all: every key, and the settings.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -16,15 +18,19 @@ use ratatui::widgets::{
     Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, FeedState, HelpMenu, HelpTab, LinkState, Search, Spec};
+use crate::app::{App, FeedState, HelpMenu, HelpTab, LinkState, OutputWatch, Search, Spec};
 use crate::cache::Download;
 use crate::comments::Comments;
 use crate::covers::Cover;
+use crate::effects;
 use crate::explore;
 use crate::pepper;
 use crate::text;
 use crate::theme;
+use crate::typed::Typed;
 use crate::video::{Video, VideoId};
 
 /// The panel beside the video, in columns, shown in windows at least
@@ -34,8 +40,8 @@ const PANEL_FROM: u16 = 90;
 
 /// The logo's badge: TikTok's note, white on black as on its icon (true
 /// black: `Color::Black` is the palette's colour 0, grey in Catppuccin).
-const BADGE_BG: Color = Color::Rgb(0, 0, 0);
-const BADGE_FG: Color = Color::Rgb(255, 255, 255);
+const BADGE_BG: Color = theme::BLACK;
+const BADGE_FG: Color = theme::WHITE;
 
 /// Why videos play in mpv's window in Pepper: multiplexer `name` is between.
 fn behind(name: &str) -> String {
@@ -103,8 +109,15 @@ pub fn cover_area(video: Rect, demo: bool) -> Rect {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let now = Instant::now();
     let c = &app.colors;
     let area = frame.area();
+    // The splash screen over all of it while it's up (`splash`).
+    if let Some(splash) = &app.splash {
+        crate::splash::draw(frame.buffer_mut(), area, c, splash, now);
+        app.drawn_over.replace(Vec::new());
+        return;
+    }
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
     let areas = areas(area, app.cell, app.fullscreen);
     if let Some(stage) = areas.stage {
@@ -122,20 +135,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(block, stage);
     }
     frame.render_widget(Block::new().style(Style::new().bg(c.panel)), areas.video);
-    draw_in_box(frame, app, areas.video);
+    let in_box = draw_in_box(frame, app, areas.video);
     if let Some(panel) = areas.panel {
         draw_panel(frame, app, panel);
     }
-    // `/` and `:`: the command line takes the bottom line, what it offers
-    // over it.
+    // What's drawn over the rest is kept, for the holes in Pepper's picture:
+    // what plays, over Pepper's full screen a while after anything's done
+    // (`App::shows_controls`); what `/` and `:` offer, over the command
+    // line on the bottom line; the `?` popup.
+    let mut over = Vec::new();
+    if app.shows_controls(now) {
+        over.extend(draw_controls(frame, app, areas.video));
+    }
     if let Some(search) = &app.search {
-        let right = if explore::matching(&search.text).is_empty() {
+        let right = if explore::matching(search.typed.text()).is_empty() {
             vec![Span::from("No category matches ").fg(c.dim)]
         } else {
             line_keys(c, &[("↑↓", "move"), ("Enter", "show"), ("Esc", "close")])
         };
-        command_line(frame, app, "/", &search.text, right, areas.bottom);
-        draw_offers(frame, app, search, areas.bottom, areas.panel);
+        command_line(frame, app, "/", &search.typed, right, areas.bottom);
     } else if let Some(line) = &app.command {
         let right = match &line.error {
             // Cut to fit, not left out: Enter would seem to do nothing.
@@ -153,31 +171,67 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 &[("Tab", "complete"), ("Enter", "run"), ("Esc", "close")],
             ),
         };
-        command_line(frame, app, ":", &line.text, right, areas.bottom);
-        draw_commands(frame, app, areas.bottom, areas.panel);
+        command_line(frame, app, ":", &line.typed, right, areas.bottom);
     } else {
         draw_bottom(frame, app, areas.bottom);
     }
-    if let Some(menu) = &app.help {
-        draw_help(frame, app, menu, area);
+    // The animations under the boxes and the popup (`effects`), leaving be
+    // the cover the terminal draws as a picture, and Pepper's box.
+    let pictures: Vec<Rect> = in_box
+        .cover
+        .filter(|_| app.draws_pictures())
+        .into_iter()
+        .collect();
+    let pepper_box = app.picture_in_box().then_some(areas.video);
+    let shown = effects::Shown {
+        panel: areas.panel.map(|panel| panel.inner(Margin::new(1, 1))),
+        video: app.current().map(|v| v.id.clone()),
+        waiting: in_box.waiting,
+    };
+    let kept: Vec<Rect> = pictures.iter().copied().chain(pepper_box).collect();
+    effects::under(app, frame.buffer_mut(), shown, &kept, now);
+    if let Some(search) = &app.search {
+        over.extend(draw_offers(frame, app, search, areas.bottom, areas.panel));
+    } else if app.command.is_some() {
+        over.extend(draw_commands(frame, app, areas.bottom, areas.panel));
     }
+    let popup = app
+        .help
+        .as_ref()
+        .map(|menu| draw_help(frame, app, menu, area));
+    over.extend(popup);
+    // The screen dims behind the popup; Pepper's box with it, once one's
+    // open over it.
+    let kept: Vec<Rect> = match popup {
+        Some(_) => pictures,
+        None => pictures.into_iter().chain(pepper_box).collect(),
+    };
+    effects::over(app, frame.buffer_mut(), popup, &kept);
+    app.drawn_over.replace(over);
+}
+
+/// What `draw_in_box` drew that the animations need: the row saying the
+/// box waits, and the cover, where.
+#[derive(Default)]
+struct InBox {
+    waiting: Option<Rect>,
+    cover: Option<Rect>,
 }
 
 /// In the box, centred: what would play and how its download is going, or
 /// why there's nothing.
-fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) -> InBox {
     let c = &app.colors;
     // Pepper shows the picture over the box: black under it, nothing else.
     // True black: `Color::Black` is the palette's colour 0, which themes
     // paint grey (#45475a in Catppuccin).
     if app.picture_in_box() {
-        frame.render_widget(
-            Block::new().style(Style::new().bg(Color::Rgb(0, 0, 0))),
-            area,
-        );
-        return;
+        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), area);
+        return InBox::default();
     }
-    let lines = match app.current() {
+    // The last line, and whether it says the box waits (for the light
+    // across it).
+    let (lines, waits) = match app.current() {
         Some(video) => {
             let pixels = (
                 u32::from(area.width) * u32::from(app.cell.0),
@@ -191,30 +245,41 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(what).fg(c.dim));
             }
-            lines.push(if let Some(e) = &app.play_error {
-                Line::from(e.clone()).fg(c.red)
+            let (last, waits) = if let Some(e) = &app.play_error {
+                (Line::from(e.clone()).fg(c.red), false)
             } else if app.player_gone {
-                Line::from("The player closed: j or k plays on").fg(c.dim)
+                (
+                    Line::from("The player closed: j or k plays on").fg(c.dim),
+                    false,
+                )
             } else if app.loading() {
-                Line::from("Loading…").fg(c.dim)
+                (Line::from("Loading…").fg(c.dim), true)
             } else if app.shows_picture() {
-                Line::from("Playing in mpv's window").fg(c.ok)
+                (Line::from("Playing in mpv's window").fg(c.ok), false)
             } else if app.demo {
-                Line::from("Made up: nothing plays").fg(c.dim)
+                (Line::from("Made up: nothing plays").fg(c.dim), false)
             } else {
                 download_line(app, &video.id)
-            });
-            lines
+            };
+            lines.push(last);
+            (lines, waits)
         }
         None => {
-            let why = match app.feed {
-                _ if app.link == Some(LinkState::Opening) => "Opening the link…".to_owned(),
-                FeedState::Fetching(_) => "Fetching the feed…".to_owned(),
-                FeedState::Exploring => format!("Fetching {}…", app.feed_name()),
-                _ => "No videos yet".to_owned(),
+            let (why, waits) = match app.feed {
+                _ if app.link == Some(LinkState::Opening) => ("Opening the link…".to_owned(), true),
+                FeedState::Fetching(_) => ("Fetching the feed…".to_owned(), true),
+                FeedState::Exploring => (format!("Fetching {}…", app.feed_name()), true),
+                _ => ("No videos yet".to_owned(), false),
             };
-            vec![Line::from(why).fg(c.dim)]
+            (vec![Line::from(why).fg(c.dim)], waits)
         }
+    };
+    // Where the last line is, from the row the lines start on, if shown.
+    let last_row = |top: u16, rows: u16| {
+        let last = lines.last()?;
+        let row = top + lines.len() as u16 - 1;
+        let width = (last.width() as u16).min(area.width);
+        (row < top + rows).then(|| Rect::new(area.x + (area.width - width) / 2, row, width, 1))
     };
     let cover = app.current().and_then(|v| match app.covers.get(&v.id) {
         Some(Cover::Ready {
@@ -237,7 +302,12 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
                 area.width,
                 area.bottom() - picture.bottom(),
             );
+            let waiting = last_row(below.y, below.height).filter(|_| waits);
             frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), below);
+            InBox {
+                waiting,
+                cover: Some(picture),
+            }
         }
         _ => {
             let height = (lines.len() as u16).min(area.height);
@@ -247,25 +317,32 @@ fn draw_in_box(frame: &mut Frame, app: &App, area: Rect) {
                 area.width,
                 height,
             );
+            let waiting = last_row(middle.y, middle.height).filter(|_| waits);
             frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+            InBox {
+                waiting,
+                cover: None,
+            }
         }
     }
 }
 
-/// How the download of video `id` is going.
-fn download_line(app: &App, id: &VideoId) -> Line<'static> {
+/// How the download of video `id` is going, and whether it's yet to come.
+fn download_line(app: &App, id: &VideoId) -> (Line<'static>, bool) {
     let c = &app.colors;
     match app.downloads.get(id) {
-        Some(Download::Getting { got, of: Some(of) }) if *of > 0 => {
-            Line::from(format!("Downloading {}%", got * 100 / of)).fg(c.dim)
-        }
-        Some(Download::Getting { got, .. }) => {
-            Line::from(format!("Downloading {}", size(*got))).fg(c.dim)
-        }
-        Some(Download::Ready(_)) => Line::from("Ready to play").fg(c.ok),
-        Some(Download::Streams) => Line::from("Too big to download: streams").fg(c.dim),
-        Some(Download::Failed(e)) => Line::from(format!("Download failed: {e}")).fg(c.red),
-        None => Line::from("Waiting to download").fg(c.dim),
+        Some(Download::Getting { got, of: Some(of) }) if *of > 0 => (
+            Line::from(format!("Downloading {}%", got * 100 / of)).fg(c.dim),
+            true,
+        ),
+        Some(Download::Getting { got, .. }) => (
+            Line::from(format!("Downloading {}", size(*got))).fg(c.dim),
+            true,
+        ),
+        Some(Download::Ready(_)) => (Line::from("Ready to play").fg(c.ok), false),
+        Some(Download::Streams) => (Line::from("Too big to download: streams").fg(c.dim), false),
+        Some(Download::Failed(e)) => (Line::from(format!("Download failed: {e}")).fg(c.red), false),
+        None => (Line::from("Waiting to download").fg(c.dim), true),
     }
 }
 
@@ -377,13 +454,13 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// A command line on the bottom line, as tuitube's `:` (vim's): `prompt`
-/// (`/` or `:`) and what's `typed`, then on the right its keys, or why
-/// not; those only if they take at most half the line.
+/// (`/` or `:`) and what's `typed`, its cursor a block, then on the right
+/// its keys, or why not; those only if they take at most half the line.
 fn command_line(
     frame: &mut Frame,
     app: &App,
     prompt: &'static str,
-    typed: &str,
+    typed: &Typed,
     mut right: Vec<Span<'static>>,
     area: Rect,
 ) {
@@ -394,19 +471,53 @@ fn command_line(
         right.clear();
         right_width = 0;
     }
-    let typed = tail(typed, width.saturating_sub(right_width + 2));
-    let used = 2 + Span::raw(typed.to_owned()).width();
-    let mut spans = vec![
-        Span::from(prompt).fg(c.accent).bold(),
-        Span::from(typed.to_owned()).fg(c.text),
-        Span::from("▏").fg(c.accent),
-        Span::raw(" ".repeat(width.saturating_sub(used + right_width))),
-    ];
+    // The prompt, and a column for the cursor past the end.
+    let room = width.saturating_sub(right_width + 2);
+    let mut spans = vec![Span::from(prompt).fg(c.accent).bold()];
+    spans.extend(with_cursor(typed, room, c));
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + right_width)),
+    ));
     spans.extend(right);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::new().bg(c.bg)),
         area,
     );
+}
+
+/// The cursor of a line being typed: a block in the accent's colour, as
+/// tuitube's.
+fn cursor(c: &theme::Colors) -> Style {
+    Style::new().fg(c.panel).bg(c.accent)
+}
+
+/// What's typed, in `room` columns and one more, the cursor a block on the
+/// letter it's before (on a space at the end). The cursor stays in view,
+/// with what's after it as far as there's room (half of it, when what's
+/// before needs more). As tuitube's.
+fn with_cursor(typed: &Typed, room: usize, c: &theme::Colors) -> Vec<Span<'static>> {
+    let (before, after) = typed.text().split_at(typed.at());
+    let (under, after) = match after.graphemes(true).next() {
+        Some(letter) => (letter, &after[letter.len()..]),
+        None => (" ", ""),
+    };
+    // A letter wider than the whole line, or one taking no column (an
+    // accent with no letter), shows as a block alone.
+    let width = cells(under);
+    let under = if width == 0 || width > room + 1 {
+        " "
+    } else {
+        under
+    };
+    let room = (room + 1).saturating_sub(cells(under));
+    let before = tail(before, room.saturating_sub(cells(after).min(room / 2)));
+    let after = head(after, room.saturating_sub(cells(before)));
+    vec![
+        Span::from(before.to_owned()).fg(c.text),
+        Span::styled(under.to_owned(), cursor(c)),
+        Span::from(after.to_owned()).fg(c.text),
+    ]
 }
 
 /// Keys and what each does, as a command line shows them on its right.
@@ -421,13 +532,33 @@ fn line_keys(c: &theme::Colors, keys: &[(&'static str, &'static str)]) -> Vec<Sp
     spans
 }
 
-/// The end of `text` that fits in `width` columns.
+/// The columns `text` takes, a letter at a time, as the terminal draws it.
+fn cells(text: &str) -> usize {
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+/// The end of `text` that fits in `width` columns, whole letters.
 fn tail(text: &str, width: usize) -> &str {
     let mut used = 0;
-    for (at, c) in text.char_indices().rev() {
-        used += Span::raw(c.encode_utf8(&mut [0; 4]).to_owned()).width();
+    let mut start = text.len();
+    for (i, letter) in text.grapheme_indices(true).rev() {
+        let w = letter.width();
+        if used + w > width {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    &text[start..]
+}
+
+/// The start of `text` that fits in `width` columns, whole letters.
+fn head(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, letter) in text.grapheme_indices(true) {
+        used += letter.width();
         if used > width {
-            return &text[at + c.len_utf8()..];
+            return &text[..i];
         }
     }
     text
@@ -438,14 +569,20 @@ fn tail(text: &str, width: usize) -> &str {
 /// match what's typed, the feed shown marked, the cursor's row lit, and a
 /// scrollbar when they don't all fit; no box when none match. The box goes
 /// over the `panel`, as wide and on its bottom edge, so the video plays on
-/// beside it; with no panel, over the video's side.
-fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, panel: Option<Rect>) {
+/// beside it; with no panel, over the video's side. Where it is, if drawn.
+fn draw_offers(
+    frame: &mut Frame,
+    app: &App,
+    search: &Search,
+    bottom: Rect,
+    panel: Option<Rect>,
+) -> Option<Rect> {
     const TITLE: &str = " Categories ";
     let c = &app.colors;
-    let offered = explore::matching(&search.text);
+    let offered = explore::matching(search.typed.text());
     let rows = rows_over(bottom, offered.len());
     if rows == 0 {
-        return;
+        return None;
     }
     // As wide as the longest of all, so it keeps its width as it narrows;
     // names are ASCII: bytes are cells.
@@ -508,18 +645,19 @@ fn draw_offers(frame: &mut Frame, app: &App, search: &Search, bottom: Rect, pane
             &mut state,
         );
     }
+    Some(popup)
 }
 
 /// What `:` offers while its command is typed, as tuitube's completions:
 /// each command with its argument and what it does, in a box over the
-/// command line as `/`'s, the one Tab completes lit.
-fn draw_commands(frame: &mut Frame, app: &App, bottom: Rect, panel: Option<Rect>) {
+/// command line as `/`'s, the one Tab completes lit. Where it is, if drawn.
+fn draw_commands(frame: &mut Frame, app: &App, bottom: Rect, panel: Option<Rect>) -> Option<Rect> {
     const TITLE: &str = " Commands ";
     let c = &app.colors;
     let offered = app.command_offers();
     let rows = rows_over(bottom, offered.len());
     if rows == 0 {
-        return;
+        return None;
     }
     let name = |spec: &Spec| format!("{} {}", spec.name, spec.hint);
     // ASCII: bytes are cells.
@@ -560,6 +698,7 @@ fn draw_commands(frame: &mut Frame, app: &App, bottom: Rect, panel: Option<Rect>
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    Some(popup)
 }
 
 /// How many of `want` rows a box over the command line (`bottom`) shows:
@@ -600,7 +739,7 @@ fn box_over_line(
 }
 
 /// Every key, for the `?` popup's first tab.
-const KEYS: [(&str, &str); 11] = [
+const KEYS: [(&str, &str); 12] = [
     ("j  ↓", "the next video"),
     ("k  ↑", "the one before"),
     (
@@ -608,6 +747,10 @@ const KEYS: [(&str, &str); 11] = [
         "For You, or one of Explore's categories: type, ↑ ↓, Enter",
     ),
     (":", "open <link>: play a TikTok link (or just paste one)"),
+    (
+        "← →  Home End",
+        "in / and :, move the cursor; with Alt a word; Ctrl-w Ctrl-u rub out",
+    ),
     ("Space", "pause or play"),
     ("h l  ← →  , .", "back or on 5 s"),
     (
@@ -619,13 +762,16 @@ const KEYS: [(&str, &str); 11] = [
         "fill the tab in Pepper; elsewhere, mpv's window the screen",
     ),
     ("r", "fetch more videos now"),
-    ("?", "these keys, and the settings: the theme"),
+    (
+        "?",
+        "these keys, and the settings: unplugging, animations, the theme",
+    ),
     ("q  Esc  Ctrl-c", "quit"),
 ];
 
 /// The `?` popup, centered, as tuitube's: a tab with every key, and one
-/// with the settings; its own keys along its bottom border.
-fn draw_help(frame: &mut Frame, app: &App, menu: &HelpMenu, area: Rect) {
+/// with the settings; its own keys along its bottom border. Where it is.
+fn draw_help(frame: &mut Frame, app: &App, menu: &HelpMenu, area: Rect) -> Rect {
     let c = &app.colors;
     let keys = key_lines(c);
     let (settings, cursor) = settings_lines(app, menu);
@@ -686,6 +832,7 @@ fn draw_help(frame: &mut Frame, app: &App, menu: &HelpMenu, area: Rect) {
         HelpTab::Settings => (settings, (cursor + 1).saturating_sub(rows)),
     };
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+    popup
 }
 
 /// The keys tab: every key, and what it does.
@@ -702,18 +849,19 @@ fn key_lines(c: &theme::Colors) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The settings tab: the themes, the one in use dotted, the one under the
-/// cursor lit; and the line the cursor is on.
+/// The settings tab, as tuitube's: pausing when the headphones are
+/// unplugged and the animations, ticked when on, then the themes, the one
+/// in use dotted; the row under the cursor lit; and the line it's on.
 fn settings_lines(app: &App, menu: &HelpMenu) -> (Vec<Line<'static>>, usize) {
     let c = &app.colors;
-    let mut lines = vec![Line::from(" Theme").fg(c.dim).bold()];
+    let mut lines = Vec::new();
     let mut cursor = 0;
-    for (row, (id, name)) in theme::names().iter().enumerate() {
+    let mut add = |lines: &mut Vec<Line<'static>>, row: usize, mark: &'static str, label: &str| {
         let chosen = row == menu.selected;
         let line = Line::from(vec![
             Span::from(if chosen { "▌" } else { " " }).fg(c.accent),
-            Span::from(if *id == app.theme { " ● " } else { " ○ " }).fg(c.accent),
-            Span::from(name.clone()).fg(c.text),
+            Span::from(mark).fg(c.accent),
+            Span::from(label.to_owned()).fg(c.text),
         ]);
         if chosen {
             cursor = lines.len();
@@ -721,12 +869,88 @@ fn settings_lines(app: &App, menu: &HelpMenu) -> (Vec<Line<'static>>, usize) {
         } else {
             lines.push(line);
         }
+    };
+    let heading = |text: &'static str| Line::from(text).fg(c.dim).bold();
+    let check = |on: bool| if on { " [✓] " } else { " [ ] " };
+    lines.push(heading(" Playing"));
+    add(
+        &mut lines,
+        HelpMenu::PAUSE_ON_UNPLUG,
+        check(app.pause_on_unplug),
+        "Pause when the headphones are unplugged (macOS)",
+    );
+    // Not a row: why unplugging can't be seen, if it can't.
+    if let OutputWatch::Failed(why) = &app.output_watch {
+        lines.push(Line::from(format!("     Unplugging can't be seen: {why}")).fg(c.dim));
+    }
+    lines.push(Line::default());
+    lines.push(heading(" Look"));
+    add(
+        &mut lines,
+        HelpMenu::ANIMATIONS,
+        check(app.animations),
+        effects::ABOUT,
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Theme"));
+    for (n, (id, name)) in theme::names().iter().enumerate() {
+        let dot = if *id == app.theme { " ● " } else { " ○ " };
+        add(&mut lines, HelpMenu::THEMES + n, dot, name);
     }
     if let Some(e) = &menu.error {
         lines.push(Line::default());
         lines.push(Line::from(format!(" {e}")).fg(c.red));
     }
     (lines, cursor)
+}
+
+/// The rows of what plays over Pepper's full screen.
+const CONTROLS_ROWS: u16 = 3;
+
+/// What plays, over the bottom of Pepper's full-screen picture as TikTok's
+/// app shows it: the author, the caption's first line, and how far along
+/// it is, on the theme's background (Pepper cuts a hole in the picture for
+/// it). Where it is, if it fits.
+fn draw_controls(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+    let c = &app.colors;
+    let video = app.current()?;
+    let picture = pepper::portrait_area(area, app.cell);
+    if picture.height <= CONTROLS_ROWS || picture.width < 12 {
+        return None;
+    }
+    let strip = Rect::new(
+        picture.x,
+        picture.bottom() - CONTROLS_ROWS,
+        picture.width,
+        CONTROLS_ROWS,
+    );
+    frame.render_widget(Clear, strip);
+    frame.render_widget(Block::new().style(Style::new().bg(c.bg)), strip);
+    let inner = strip.inner(Margin::new(1, 0));
+    let caption = video.caption.lines().next().unwrap_or_default();
+    let (when, done) = match position(app, video) {
+        Some((at, length, paused)) => {
+            let paused = if paused { " · paused" } else { "" };
+            let when = format!(" {} / {}{paused}", clock(at), clock(length));
+            (when, Some((at, length)))
+        }
+        None => (format!(" {}", clock(video.seconds)), None),
+    };
+    let room = inner
+        .width
+        .saturating_sub(Span::raw(when.clone()).width() as u16);
+    let mut bar = match done {
+        Some((at, length)) => progress(app, at, length, room),
+        None => Line::from("━".repeat(usize::from(room))).fg(c.border),
+    };
+    bar.push_span(Span::from(when).fg(c.dim));
+    let lines = vec![
+        Line::from(format!("@{}", video.author)).fg(c.accent).bold(),
+        Line::from(caption.to_owned()).fg(c.text),
+        bar,
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+    Some(strip)
 }
 
 /// Where the video shown is, how long it is, and whether it's paused,
@@ -813,6 +1037,13 @@ fn status(app: &App) -> Line<'static> {
         Some(LinkState::Failed(why)) => return Line::from(why.clone()).fg(c.red),
         None => {}
     }
+    // The headphones went: what plays waits for you.
+    if let Some(name) = &app.held {
+        return Line::from(format!(
+            "Paused: “{name}” was disconnected · space plays on"
+        ))
+        .fg(c.warning);
+    }
     match &app.feed {
         FeedState::NoBrowser => {
             Line::from("No browser for the feed: brew install lightpanda-io/browser/lightpanda")
@@ -895,6 +1126,7 @@ pub fn size(bytes: u64) -> String {
 pub mod tests {
     use std::path::PathBuf;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -981,13 +1213,13 @@ pub mod tests {
         // over it, on the panel's bottom edge and as wide, a box of what
         // matches, the feed shown marked and the cursor's row lit across.
         app.search = Some(Search {
-            text: "fo".into(),
+            typed: Typed::new("fo".into()),
             selected: 1,
             ..Search::default()
         });
         let text = screen(&app, 120, 40);
         let rows: Vec<&str> = text.lines().collect();
-        assert!(rows[39].starts_with("/fo▏ "), "{}", rows[39]);
+        assert!(rows[39].starts_with("/fo "), "{}", rows[39]);
         assert!(
             rows[39].ends_with(" ↑↓ move · Enter show · Esc close "),
             "{}",
@@ -1006,6 +1238,11 @@ pub mod tests {
         assert_eq!(bg_of(&app, (120, 40), "Food", 0), app.colors.selected);
         assert_eq!(bg_of(&app, (120, 40), "Food", 42), app.colors.selected);
         assert!(!text.contains("Comedy"));
+        assert_eq!(
+            *app.drawn_over.borrow(),
+            [Rect::new(72, 35, 48, 4)],
+            "where it is"
+        );
         // The video's side isn't covered.
         assert!(
             !rows[36]
@@ -1024,13 +1261,19 @@ pub mod tests {
             rows[35]
         );
         assert!(rows[37].starts_with("│▌  Food "), "{}", rows[37]);
+        assert_eq!(
+            *app.drawn_over.borrow(),
+            [Rect::new(0, 35, 23, 4)],
+            "where it is"
+        );
         // Nothing matches: no box, and the command line says so.
         app.search = Some(Search {
-            text: "zzz".into(),
+            typed: Typed::new("zzz".into()),
             ..Search::default()
         });
         let text = screen(&app, 120, 40);
         assert!(!text.contains("Categories"));
+        assert!(app.drawn_over.borrow().is_empty());
         assert!(
             text.lines()
                 .last()
@@ -1078,7 +1321,7 @@ pub mod tests {
                 .lines()
                 .last()
                 .unwrap()
-                .starts_with("/▏ ")
+                .starts_with("/ ")
         );
     }
 
@@ -1089,7 +1332,7 @@ pub mod tests {
         app.command = Some(CommandLine::default());
         let text = screen(&app, 120, 40);
         let rows: Vec<&str> = text.lines().collect();
-        assert!(rows[39].starts_with(":▏ "), "{}", rows[39]);
+        assert!(rows[39].starts_with(": "), "{}", rows[39]);
         assert!(
             rows[39].ends_with(" Tab complete · Enter run · Esc close "),
             "{}",
@@ -1115,18 +1358,35 @@ pub mod tests {
         assert!(rows[37].starts_with("│▌  open <link>  play a TikTok link │"));
         // The command typed: no box; why a line didn't run, in its place.
         app.command = Some(CommandLine {
-            text: "open x".into(),
+            typed: Typed::new("open x".into()),
             error: Some("Not a TikTok video's link".into()),
         });
         let text = screen(&app, 120, 40);
         assert!(!text.contains("Commands"));
         let last = text.lines().last().unwrap();
-        assert!(last.starts_with(":open x▏ "), "{last}");
+        assert!(last.starts_with(":open x "), "{last}");
         assert!(last.ends_with(" Not a TikTok video's link "), "{last}");
+        // The cursor: a block past the end, or on the letter it's before.
+        assert_eq!(bg_of(&app, (120, 40), ":open x", 7), app.colors.accent);
+        let line = app.command.as_mut().unwrap();
+        line.typed
+            .edit(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 50);
+        assert_eq!(bg_of(&app, (120, 40), ":open x", 6), app.colors.accent);
+        assert_eq!(bg_of(&app, (120, 40), ":open x", 5), app.colors.bg);
         // A narrow window: cut to fit, never left out.
         let narrow = screen(&app, 40, 40);
         let last = narrow.lines().last().unwrap();
         assert!(last.ends_with(" Not a TikTok vide… "), "{last}");
+        // A line longer than the room keeps the cursor in view.
+        let long = format!("open {}", "y".repeat(200));
+        let line = app.command.as_mut().unwrap();
+        line.typed = Typed::new(long);
+        line.typed
+            .edit(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 500);
+        line.error = None;
+        let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
+        assert!(last.starts_with(":open yyy"), "{last}");
+        assert_eq!(bg_of(&app, (120, 40), ":open", 1), app.colors.accent);
         // A link being opened, or why it couldn't be, on the status line;
         // with no videos yet, in the box too.
         app.command = None;
@@ -1332,13 +1592,35 @@ pub mod tests {
     }
 
     #[test]
+    fn what_plays_shows_over_the_bottom_of_peppers_full_screen() {
+        let mut app = crate::app::tests::app_with(vec![video("1")]);
+        crate::app::tests::set_playing(&mut app, "1", true);
+        (app.pepper, app.pepper_holes, app.fullscreen) = (true, true, true);
+        app.controls_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        let text = screen(&app, 120, 40);
+        assert!(
+            text.contains("@someone") && text.contains("first line"),
+            "{text}"
+        );
+        assert!(text.contains(" 0:00 / 1:15"), "{text}");
+        // Over the picture's bottom (44 columns from 38, 9:16 in 39 rows),
+        // kept for its hole.
+        let strip = app.drawn_over.borrow().clone();
+        assert_eq!(strip, [Rect::new(38, 36, 44, CONTROLS_ROWS)]);
+        // Its time up: gone.
+        app.controls_until = None;
+        assert!(!screen(&app, 120, 40).contains("@someone"));
+        assert!(app.drawn_over.borrow().is_empty());
+    }
+
+    #[test]
     fn the_popup_lists_every_key_then_the_settings() {
         use std::cell::Cell;
         let mut app = crate::app::tests::app_with(vec![video("1")]);
         app.help = Some(HelpMenu {
             tab: HelpTab::Keys,
             scroll: Cell::new(99),
-            selected: 1,
+            selected: HelpMenu::THEMES + 1,
             error: None,
         });
         let text = screen(&app, 120, 40);
@@ -1354,10 +1636,22 @@ pub mod tests {
         }
         assert!(text.contains("j k scroll · Tab settings · Esc close"));
         assert_eq!(app.help.as_ref().unwrap().scroll.get(), 0, "kept in range");
+        // Where it is, for the holes in Pepper's picture.
+        let over = app.drawn_over.borrow().clone();
+        assert_eq!(over.len(), 1, "{over:?}");
+        let top: String = text
+            .lines()
+            .nth(usize::from(over[0].y))
+            .unwrap()
+            .chars()
+            .skip(usize::from(over[0].x))
+            .collect();
+        assert!(top.starts_with("╭  Keys "), "{top}");
         // The panel's still there, under it; the bottom line names `?`.
         assert!(text.contains("@someone"));
         assert!(text.lines().last().unwrap().contains("? help"));
-        // The settings tab: the theme in use dotted, the cursor's lit.
+        // The settings tab: the settings ticked when on, the theme in use
+        // dotted, the cursor's lit.
         let menu = app.help.as_mut().unwrap();
         menu.tab = HelpTab::Settings;
         menu.error = Some("settings.toml isn't valid TOML, so it wasn't changed".into());
@@ -1370,11 +1664,15 @@ pub mod tests {
             line(&text, "Catppuccin Mocha").contains(" ● "),
             "the one in use"
         );
+        assert!(line(&text, "Pause when the headphones").contains(" [✓] "));
+        app.animations = false;
+        let text = screen(&app, 120, 40);
+        assert!(line(&text, "Animations").contains(" [ ] "));
         assert!(text.contains("Rosé Pine") && text.contains("isn't valid TOML"));
         assert!(text.contains("Enter use · Tab keys · Esc close"));
         assert!(!text.contains("the next video"));
         // A short window: the cursor kept in view.
-        app.help.as_mut().unwrap().selected = theme::names().len() - 1;
+        app.help.as_mut().unwrap().selected = HelpMenu::THEMES + theme::names().len() - 1;
         let text = screen(&app, 120, 8);
         assert!(line(&text, "Rosé Pine").contains("▌"));
     }

@@ -1,10 +1,10 @@
 //! Your settings, in `settings.toml` in the data folder, as tuitube keeps
-//! its own: the theme (picked in `?`'s settings) and the volume (`-` and `+`, kept
-//! when tuitok ends). Read leniently, as
-//! `guest.json` is (a file that isn't a plain file of yours, is too big or
-//! doesn't read gives the defaults; a theme that isn't built in is the
-//! default one), and saved one setting at a time, so whatever else the
-//! file holds stays.
+//! its own: the theme, pausing when the headphones are unplugged and the
+//! animations (picked in `?`'s settings) and the volume (`-` and `+`, kept
+//! when tuitok ends). Read leniently, as `guest.json` is (a file that isn't
+//! a plain file of yours, is too big or doesn't read gives the defaults; a
+//! theme that isn't built in is the default one), and saved one setting at
+//! a time, so whatever else the file holds stays.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,13 @@ pub struct Settings {
     pub theme: &'static str,
     /// How loud videos play, in percent: 0 to 100 (`-` and `+` change it).
     pub volume: u32,
+    /// Pause when the headphones (or whatever plays the sound) go: pulled
+    /// out, or a Bluetooth one turned off or out of reach, as an iPhone
+    /// does, rather than go on from the speakers. macOS only.
+    pub pause_on_unplug: bool,
+    /// The screen fades in, popups open out, the box shows it loads
+    /// (`ui::effects`).
+    pub animations: bool,
 }
 
 impl Default for Settings {
@@ -30,6 +37,8 @@ impl Default for Settings {
         Self {
             theme: theme::DEFAULT,
             volume: 100,
+            pause_on_unplug: true,
+            animations: true,
         }
     }
 }
@@ -44,9 +53,17 @@ pub fn load(data: &Path) -> Settings {
     let table = read(&path(data)).ok().flatten().unwrap_or_default();
     let theme = table.get("theme").and_then(toml::Value::as_str);
     let volume = table.get("volume").and_then(toml::Value::as_integer);
+    let on = |key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
     Settings {
         theme: theme::id(theme.unwrap_or_default()),
         volume: volume.map_or(100, |v| v.clamp(0, 100) as u32),
+        pause_on_unplug: on("pause_on_unplug"),
+        animations: on("animations"),
     }
 }
 
@@ -106,6 +123,12 @@ mod tests {
         assert_eq!(load(&data).theme, "nord");
         let text = std::fs::read_to_string(path(&data)).unwrap();
         assert!(text.contains("later = 1"), "{text}");
+        save(&data, "animations", false.into()).unwrap();
+        let both = load(&data);
+        assert_eq!(
+            (both.theme, both.animations, both.pause_on_unplug),
+            ("nord", false, true)
+        );
         let mode = std::fs::metadata(path(&data)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(

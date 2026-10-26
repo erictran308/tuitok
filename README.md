@@ -34,7 +34,9 @@ Made for [Pepper](https://github.com/erictran308/pepper), the terminal that play
 - **Plays in about 2.5 seconds.** The first batch is a single video, then they grow 2, 3, 5, 8 and 13, one after another, each video handed on as soon as TikTok's page has it. The next three are downloaded while you watch, so `j` plays the next one straight away.
 - **Top comments, as TikTok ranks them.** Up to ten, as many as fit, with their likes, under the counts: fetched for the video you're on and the next, from TikTok's comment list, with no cookie.
 - **A fraction of a browser.** A small headless browser ([Lightpanda](https://github.com/lightpanda-io/browser), else Chrome) opens TikTok's For You only to fetch a batch, about 10 s for 13 videos, then closes. After the first 32 videos, the next 13 are fetched only when you reach the 8th of the last 13. [The numbers](#why-a-terminal).
+- **Pauses when the headphones go.** As on an iPhone: headphones pulled out, or a Bluetooth headset turned off, and what plays pauses instead of going on from the speakers (macOS; `?`, Settings, turns it off).
 - **Keyboard only.** Arrows or vim keys, nothing to click.
+- **Moves a little.** The screen fades in after a splash of tuitok's note, the panel sweeps in for each video, a light runs across what the box says while a video comes, and `?` opens out (`?`, Settings, turns it off).
 - **New videos every time.** tuitok goes on as the same TikTok guest from one run to the next and skips what you've watched, so a new start doesn't replay the same popular videos. `tuitok --forget` starts over.
 
 ## Made for Pepper
@@ -45,6 +47,8 @@ tuitok is built around it:
 
 - **The video plays in the tab.** It sits in its upright box beside the panel, in the same window as your shell and your editor: no window to move, or to lose behind the others.
 - **`f` fills the tab** with the video, and `f` again brings the panel back. Pepper's ⌘↩ makes the window full screen too.
+- **What plays, over the full tab.** With `f`, the author, the caption and how far along it is show over the bottom of the video for 3 s after any key, and while it's paused, as in TikTok's app (Pepper 1.3.1-pepper.4 and later).
+- **Popups don't stop the picture.** The `?` popup, or the categories over the video in a narrow window, show through holes in it, and the video plays on around them (Pepper 1.3.1-pepper.4 and later; an older Pepper hides the picture while one is open).
 - **Pepper's own player.** tuitok drives `pepper-play`, which comes inside Pepper.app and plays through Homebrew's mpv, decoded on the graphics chip: TikTok's H.265 up to 1080×1920.
 - **Light on your Mac.** Pepper's player, Pepper and tuitok together use about 18% of a core while a video plays, against 49% for TikTok in a Chrome window ([measured](#why-a-terminal)).
 
@@ -103,12 +107,13 @@ tuitok
 | `k` or `↑` | the one before |
 | `/` | For You, or one of Explore's 21 categories: type to narrow, `↑` `↓`, `enter` |
 | `:` | a command: `open <link>` plays a TikTok link (`tab` completes `open`); pasting a link does the same |
+| `←` `→`, `home` `end` | in `/` and `:`, move the cursor (with `alt`, a word); `ctrl-w` `ctrl-u` rub out a word or all before it |
 | `space` | pause |
 | `m` | mute |
 | `-` `+` | volume down or up (kept for next time) |
 | `h` `l`, `←` `→` or `,` `.` | back or on 5 s |
 | `f` | the video fills the tab (Pepper), or mpv's window the screen |
-| `?` | every key, and the settings: `tab` to them, then pick a theme with `j` `k` and `enter` |
+| `?` | every key, and the settings: `tab` to them, then with `j` `k` and `enter` pausing when the headphones go and the animations on or off, or a theme |
 | `r` | fetch more now |
 | `q` | quit |
 

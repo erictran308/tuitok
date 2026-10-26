@@ -10,26 +10,29 @@ mod comments;
 mod config;
 mod covers;
 mod demo;
+mod effects;
 mod explore;
 mod feed;
 mod guest;
 mod links;
+mod output;
 mod pepper;
 mod player;
+mod screen;
 mod settings;
+mod splash;
 mod text;
 mod theme;
 mod tmux;
 mod tools;
+mod typed;
 mod ui;
 mod video;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::OnceLock;
 
 use browser::Engine;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 
 const HELP: &str = "\
 tuitok: TikTok's For You feed in the terminal, playing inside Pepper
@@ -57,10 +60,6 @@ tuitok isn't made or endorsed by TikTok or ByteDance.";
 /// The box `--feed` picks renditions for, in pixels: about an upright box
 /// in a laptop's Pepper window.
 const LIST_BOX: (u32, u32) = (608, 1080);
-
-/// Why one of tuitok's tasks panicked, once one has: tuitok then quits as
-/// with q, and says it once the terminal is back ([`start_screen`]).
-static TASK_PANIC: OnceLock<String> = OnceLock::new();
 
 fn main() -> ExitCode {
     // Before any thread starts: code tuitok uses starts programs by name
@@ -124,7 +123,7 @@ fn fail(e: &anyhow::Error) -> ExitCode {
 
 /// How a run ended: its error, else a task's panic, else well.
 fn ended(result: std::io::Result<()>) -> ExitCode {
-    match (result, TASK_PANIC.get()) {
+    match (result, screen::task_panic()) {
         (Err(e), _) => fail(&e.into()),
         (Ok(()), Some(why)) => {
             eprintln!("tuitok: a bug ended it: {why}");
@@ -136,6 +135,9 @@ fn ended(result: std::io::Result<()>) -> ExitCode {
 
 /// A run, playing `first`'s video first if it's given (`tuitok LINK`).
 fn run(first: Option<links::Link>) -> ExitCode {
+    if let Err(e) = screen::need() {
+        return fail(&e);
+    }
     let session = match config::Session::start() {
         Ok(session) => session,
         Err(e) => return fail(&e),
@@ -154,6 +156,10 @@ fn run(first: Option<links::Link>) -> ExitCode {
     };
     let engines = feed::engines(&tools, None);
     let mut app = app::App::new(port.is_some(), engines, &session, player_with);
+    app.pepper_holes = port.is_some() && pepper::takes_holes();
+    // macOS: what plays pauses when the headphones go (`pause_on_unplug`),
+    // watched from the first video played.
+    app.output_watch = app::OutputWatch::Later;
     // The last run's guest: the same TikTok guest goes on, and what was
     // watched isn't shown again.
     app.carry_in(guest::load(&session.data));
@@ -161,12 +167,18 @@ fn run(first: Option<links::Link>) -> ExitCode {
     if let Some(link) = first {
         app.open_first(link);
     }
-    let mut terminal = ratatui::init();
-    start_screen(&mut app);
+    let mut terminal = match screen::take() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            session.end();
+            return fail(&e);
+        }
+    };
+    start_screen(&mut app, &mut terminal);
     let result = runtime.block_on(app.run(&mut terminal));
-    bracketed_paste(false);
-    ratatui::restore();
-    tmux::restore();
+    // A closed tab has nothing to put back: what's written from here on
+    // goes nowhere, and can't fail (`screen::gone`).
+    screen::hand_back(terminal);
     // A batch still being fetched and the downloads end here, the browser
     // killed (`Browser`'s `Drop`), before the session's folder goes.
     drop(runtime);
@@ -198,55 +210,30 @@ fn run_demo() -> ExitCode {
     if let Ok(data) = config::data_dir_path() {
         app.use_settings(settings::load(&data), None);
     }
-    let mut terminal = ratatui::init();
-    start_screen(&mut app);
+    let mut terminal = match screen::take() {
+        Ok(terminal) => terminal,
+        Err(e) => return fail(&e),
+    };
+    start_screen(&mut app, &mut terminal);
     let result = runtime.block_on(app.run(&mut terminal));
-    bracketed_paste(false);
-    ratatui::restore();
-    tmux::restore();
+    screen::hand_back(terminal);
     ended(result)
 }
 
-/// Once the terminal is set up and before keys are read: how it draws
-/// pictures (`covers::picker` asks it), pastes whole (a link pasted isn't
-/// taken for keys), and a panic hook. A picture
-/// decoder's caught panic passes without tearing the screen down. Another
-/// task's would leave tuitok drawing on a terminal put back to normal
-/// (tokio catches it and the event loop goes on), so the screen stays and
-/// tuitok quits as with q (SIGTERM, which `App::run` takes so): the player
-/// quits, Pepper's box goes, and why is said after ([`ended`]). Only the
-/// event loop's own (on the main thread) restores the terminal at once
-/// (ratatui's hook, set by `ratatui::init`).
-fn start_screen(app: &mut app::App) {
+/// Once the terminal is taken over (`screen::take`, which sets the panic
+/// hook) and before keys are read: with animations on, the splash screen
+/// at once, while the rest starts behind it (`splash`); how the terminal
+/// draws pictures (`covers::picker` asks it), after tmux's pane setting is
+/// saved; the animations, live.
+fn start_screen(app: &mut app::App, terminal: &mut ratatui::DefaultTerminal) {
+    let splash = app.animations.then(|| splash::show(terminal, app.theme));
     tmux::save();
     app.set_picker(covers::picker());
     app.behind_multiplexer = pepper::behind_multiplexer();
-    bracketed_paste(true);
-    let restore = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if covers::panic_is_contained() {
-            return;
-        }
-        if std::thread::current().name() != Some("main") {
-            let _ = TASK_PANIC.set(text::one_line(&info.to_string(), 400));
-            // SAFETY: a plain signal to tuitok itself.
-            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-            return;
-        }
-        bracketed_paste(false);
-        tmux::restore();
-        restore(info);
-    }));
-}
-
-/// Asks the terminal to send pastes whole (bracketed), or not any more.
-fn bracketed_paste(on: bool) {
-    let mut out = std::io::stdout();
-    let _ = if on {
-        crossterm::execute!(out, EnableBracketedPaste)
-    } else {
-        crossterm::execute!(out, DisableBracketedPaste)
-    };
+    app.effects = effects::Effects::for_terminal().into();
+    if let Some(since) = splash {
+        app.keep_splash(since);
+    }
 }
 
 /// `--check`: what tuitok found, and where.
@@ -257,7 +244,13 @@ fn check() {
             .map_or_else(|| "not found".to_owned(), tools::shown)
     };
     match (pepper::port(), pepper::behind_multiplexer()) {
-        (Some(_), _) => println!("Pepper:      yes, videos play in this tab"),
+        (Some(_), _) if pepper::takes_holes() => {
+            println!("Pepper:      yes, videos play in this tab; popups cut holes in them")
+        }
+        (Some(_), _) => println!(
+            "Pepper:      yes, videos play in this tab, taken away under popups \
+             (this Pepper takes no holes)"
+        ),
         (None, Some(name)) => println!(
             "Pepper:      yes, but inside {name}, through which its box can't be placed: \
              videos play in mpv's window"

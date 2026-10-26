@@ -229,11 +229,11 @@ impl Player {
         let _ = self.out.send(format!("{message}\n"));
     }
 
-    /// Plays `target` in place of what plays, unpaused (mpv keeps `pause`
-    /// from one file to the next). A stream's cookie is set just before,
-    /// over the socket; a file clears it. Gives the load's number, which
-    /// [`PlayerEvent::Loaded`] names with the playlist entry it made.
-    pub fn load(&self, target: &Target) -> u64 {
+    /// Plays `target` in place of what plays, `paused` or not (mpv keeps
+    /// `pause` from one file to the next). A stream's cookie is set just
+    /// before, over the socket; a file clears it. Gives the load's number,
+    /// which [`PlayerEvent::Loaded`] names with the playlist entry it made.
+    pub fn load(&self, target: &Target, paused: bool) -> u64 {
         let (what, headers): (String, Vec<String>) = match target {
             Target::File(path) => (path.to_string_lossy().into_owned(), Vec::new()),
             Target::Stream { url, token } => (
@@ -245,7 +245,7 @@ impl Player {
             ),
         };
         self.command(json!(["set_property", "http-header-fields", headers]));
-        self.command(json!(["set_property", "pause", false]));
+        self.command(json!(["set_property", "pause", paused]));
         let load = self.loads.fetch_add(1, Ordering::Relaxed) + 1;
         self.send(json!({ "command": ["loadfile", what, "replace"], "request_id": load }));
         load
@@ -258,6 +258,11 @@ impl Player {
 
     pub fn toggle_pause(&self) {
         self.command(json!(["cycle", "pause"]));
+    }
+
+    /// Pauses, if it plays: unlike [`Player::toggle_pause`], never plays.
+    pub fn pause(&self) {
+        self.command(json!(["set_property", "pause", true]));
     }
 
     /// Sets the volume, in percent.
@@ -469,10 +474,13 @@ mod tests {
         })
         .unwrap();
         // Streamed with its cookie, then from a file.
-        player.load(&Target::Stream {
-            url: rendition.urls[0].clone(),
-            token: video.token.clone(),
-        });
+        player.load(
+            &Target::Stream {
+                url: rendition.urls[0].clone(),
+                token: video.token.clone(),
+            },
+            false,
+        );
         /// Whether a first frame comes within 20 s.
         async fn first_frame(rx: &mut mpsc::UnboundedReceiver<PlayerEvent>) -> bool {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -496,7 +504,7 @@ mod tests {
         let cache::Download::Ready(path) = cache::download(&client, &job, |_, _| {}).await else {
             panic!("no download");
         };
-        player.load(&Target::File(path));
+        player.load(&Target::File(path), false);
         assert!(first_frame(&mut rx).await, "no frame from the file");
         player.quit().await;
         let _ = std::fs::remove_dir_all(place);

@@ -23,13 +23,24 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "7.0.0"
 futures = "0.3.34"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
-libc = "0.2.190"
+libc = "0.2.191"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.53.1", features = ["full"] }
+# The animations (effects.rs), on ratatui's own core, as tuitube's: without
+# its DSL, a parser for effects written as text, which tuitok doesn't take.
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
-toml = "1.1.6"
+toml = "1.1.8"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+# macOS: the name of the device the sound played to, and the test's
+# stand-in for headphones (output.rs), as tuitube's. In the tree already,
+# through rustls-platform-verifier.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"

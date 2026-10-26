@@ -3,7 +3,7 @@
 //! progress and end, what the player says), a redraw after each, and after
 //! the frame, in Pepper, where the picture goes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ use crate::player::{Kind, Player, PlayerEvent, Sound, Target};
 use crate::settings::{self, Settings};
 use crate::text;
 use crate::theme::{self, Colors};
+use crate::typed::Typed;
 use crate::ui;
 use crate::video::{Video, VideoId};
 
@@ -55,6 +56,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How long the video shown waits for its download before it streams
 /// instead (mpv's first frame streamed: 0.2 to 0.9 s).
 const STREAM_AFTER: Duration = Duration::from_secs(1);
+
+/// How long the controls show over Pepper's full screen after anything's
+/// done (tuitube's `CONTROLS_FOR`).
+const CONTROLS_FOR: Duration = Duration::from_secs(3);
 
 /// The most videos kept before the one shown: older ones count as watched
 /// and are forgotten (their ids stay in `seen`, so they aren't shown
@@ -134,6 +139,13 @@ pub enum AppEvent {
     },
     /// What player number `player` said: an older player's words are dropped.
     Player { player: u64, event: PlayerEvent },
+    /// The device playing the sound went (headphones unplugged): its name,
+    /// as the system calls it. Pause, as an iPhone does (`crate::output`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    OutputGone(String),
+    /// tuitok can't see the headphones go: why.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    OutputUnwatched(String),
 }
 
 /// Where the feed is at, for the status line.
@@ -182,6 +194,19 @@ struct Underway {
     abort: tokio::task::AbortHandle,
 }
 
+/// Whether tuitok watches the sound's device, to pause when the headphones
+/// are unplugged (`crate::output`), as tuitube does.
+#[derive(Debug, PartialEq)]
+pub enum OutputWatch {
+    /// Never: in tests and the demo.
+    Never,
+    /// From the first video played with `pause_on_unplug` on (`main`).
+    Later,
+    Watching,
+    /// CoreAudio couldn't be asked: why.
+    Failed(String),
+}
+
 /// The tabs of the `?` popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelpTab {
@@ -190,17 +215,26 @@ pub enum HelpTab {
 }
 
 /// The `?` popup, as tuitube's: every key, and the settings. On the
-/// settings tab, Enter or Space picks the theme under the cursor and saves
-/// it at once.
+/// settings tab, Enter or Space turns the setting under the cursor on or
+/// off, or picks the theme under it, and saves it at once.
 #[derive(Debug, PartialEq)]
 pub struct HelpMenu {
     pub tab: HelpTab,
     /// The first line shown on the keys tab. Drawing keeps it in range.
     pub scroll: Cell<usize>,
-    /// The row under the cursor on the settings tab, in `theme::names()`.
+    /// The row under the cursor on the settings tab: a setting, or a theme
+    /// from `THEMES` on, in `theme::names()`.
     pub selected: usize,
-    /// Why the last theme picked couldn't be saved.
+    /// Why the last setting picked couldn't be saved.
     pub error: Option<String>,
+}
+
+impl HelpMenu {
+    /// The settings tab's rows, as tuitube's: pausing when the headphones
+    /// are unplugged, the animations, then the themes.
+    pub const PAUSE_ON_UNPLUG: usize = 0;
+    pub const ANIMATIONS: usize = 1;
+    pub const THEMES: usize = 2;
 }
 
 /// The command line while it's open (`/`): what's typed, the row under the
@@ -208,7 +242,7 @@ pub struct HelpMenu {
 /// box shows (drawing keeps the cursor in view).
 #[derive(Debug, Default, PartialEq)]
 pub struct Search {
-    pub text: String,
+    pub typed: Typed,
     pub selected: usize,
     pub scroll: Cell<usize>,
 }
@@ -217,7 +251,7 @@ pub struct Search {
 /// Enter ran couldn't run (until it's edited).
 #[derive(Debug, Default, PartialEq)]
 pub struct CommandLine {
-    pub text: String,
+    pub typed: Typed,
     pub error: Option<String>,
 }
 
@@ -265,8 +299,15 @@ pub struct App {
     pub theme: &'static str,
     settings_in: Option<PathBuf>,
     pub help: Option<HelpMenu>,
-    /// tuitok runs in Pepper (`pepper::port`).
+    /// tuitok runs in Pepper (`pepper::port`), and that Pepper takes holes
+    /// in the picture's box (`pepper::takes_holes`), so it plays on around a
+    /// popup; set by `main`.
     pub pepper: bool,
+    pub pepper_holes: bool,
+    /// What the last frame drew over the rest (the `?` popup, the boxes
+    /// over the bottom line), for the holes in Pepper's picture. Set by
+    /// `ui::draw`.
+    pub drawn_over: RefCell<Vec<Rect>>,
     /// A cell's size in pixels, and the terminal's size in cells: the box's
     /// size in pixels comes from both.
     pub cell: (u16, u16),
@@ -338,6 +379,21 @@ pub struct App {
     pub volume: u32,
     volume_kept: u32,
     pub muted: bool,
+    /// Pause when the headphones are unplugged (`?`'s settings), whether
+    /// their going is watched, and the device that went since you last
+    /// played something: what loads meanwhile starts paused.
+    pub pause_on_unplug: bool,
+    pub output_watch: OutputWatch,
+    pub held: Option<String>,
+    /// The animations (`?`'s settings): the screen fading in, the panel
+    /// sweeping in, the popup opening out; what moves, and what the frame
+    /// before showed (`effects`). They run only once `main` or `--demo`
+    /// sets `live`.
+    pub animations: bool,
+    pub effects: RefCell<crate::effects::Effects>,
+    /// The splash screen, while it's up over the first frames (`splash`,
+    /// `keep_splash`).
+    pub splash: Option<crate::splash::Splash>,
     /// The program to play with and how (`main` decides: pepper-play in
     /// Pepper, else mpv's window), the player once started, how many have
     /// been started (each one's events carry its number), what it was told
@@ -365,8 +421,11 @@ pub struct App {
     /// comment list, and Explore's pages.
     pub comments: HashMap<VideoId, Comments>,
     www_client: Option<reqwest::Client>,
-    /// `f` in Pepper: the video fills the tab.
+    /// `f` in Pepper: the video fills the tab; and, where Pepper takes
+    /// holes, when what plays stops showing over it (`shows_controls`): for
+    /// `CONTROLS_FOR` after anything's done.
     pub fullscreen: bool,
+    pub controls_until: Option<Instant>,
     /// `--demo`: made-up videos, nothing fetched, downloaded or played.
     pub demo: bool,
     /// tuitok runs in Pepper but through a multiplexer, by name
@@ -396,6 +455,8 @@ impl App {
             settings_in: None,
             help: None,
             pepper,
+            pepper_holes: false,
+            drawn_over: RefCell::new(Vec::new()),
             cell: cell_size().unwrap_or(GUESSED_CELL),
             size: crossterm::terminal::size().unwrap_or(GUESSED_SIZE),
             category: None,
@@ -435,6 +496,12 @@ impl App {
             volume: 100,
             volume_kept: 100,
             muted: false,
+            pause_on_unplug: true,
+            output_watch: OutputWatch::Never,
+            held: None,
+            animations: true,
+            effects: RefCell::default(),
+            splash: None,
             player_with,
             player: None,
             players: 0,
@@ -450,6 +517,7 @@ impl App {
             comments: HashMap::new(),
             www_client: None,
             fullscreen: false,
+            controls_until: None,
             demo: false,
             behind_multiplexer: None,
             client: None,
@@ -460,8 +528,8 @@ impl App {
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         // The terminal window closed (SIGHUP), or tuitok was asked to end
-        // (SIGTERM, also sent by a task's panic: `main::start_screen`): it
-        // quits as with q, so the player quits, Pepper's box goes and the
+        // (SIGTERM, also sent by a task's panic: `screen::set_panic_hook`):
+        // it quits as with q, so the player quits, Pepper's box goes and the
         // session's folder is deleted. Taken before any task starts.
         let mut hangup = signal(SignalKind::hangup())?;
         let mut terminate = signal(SignalKind::terminate())?;
@@ -481,28 +549,87 @@ impl App {
             None => self.fetch_more(),
         }
         let mut terminal_events = EventStream::new();
+        let mut result = Ok(());
         while !self.quit {
-            terminal.draw(|frame| ui::draw(frame, self))?;
-            let placement = self.placement();
-            write_to_terminal(&placement)?;
+            self.advance_splash(Instant::now());
+            // A frame that can't be drawn ends tuitok as a quit does; when
+            // the tab was closed (the hangup not read yet), it is one.
+            let drawn = terminal
+                .draw(|frame| ui::draw(frame, self))
+                .and_then(|_| write_to_terminal(&self.placement()));
+            if let Err(e) = drawn {
+                if !crate::screen::gone() {
+                    result = Err(e);
+                }
+                break;
+            }
+            // The next frame while something moves (the animations, the
+            // splash screen), or the controls over Pepper's full screen go.
+            let hide_in = self.controls_hide_in(Instant::now());
+            let wake = [hide_in, self.frame_in()].into_iter().flatten().min();
             tokio::select! {
                 event = terminal_events.next() => match event {
                     Some(Ok(event)) => self.on_event(event),
-                    Some(Err(e)) => return Err(e),
+                    Some(Err(e)) => {
+                        if !crate::screen::gone() {
+                            result = Err(e);
+                        }
+                        break;
+                    }
                     None => break,
                 },
                 Some(event) = app_events.recv() => self.on_app_event(event),
                 _ = hangup.recv() => self.quit = true,
                 _ = terminate.recv() => self.quit = true,
+                _ = tokio::time::sleep(wake.unwrap_or_default()), if wake.is_some() => {}
             }
         }
+        // A tab that's gone has no box to take away; the player quits anyway.
         if let Some(placed) = self.placed.take() {
-            write_to_terminal(&pepper::remove(&placed.token))?;
+            let _ = write_to_terminal(&pepper::remove(&placed.token));
         }
         if let Some(player) = self.player.take() {
             player.quit().await;
         }
-        Ok(())
+        result
+    }
+
+    /// Keeps the splash screen drawn since `since` up over the first frames
+    /// while what they show comes (`splash`).
+    pub fn keep_splash(&mut self, since: Instant) {
+        self.splash = Some(crate::splash::Splash::new(since));
+    }
+
+    /// The splash screen moves on, and goes once it's been up long enough
+    /// and the first screen is there, or it's been up its most.
+    fn advance_splash(&mut self, now: Instant) {
+        let ready = self.first_screen_ready();
+        if let Some(splash) = &mut self.splash
+            && !splash.advance(now, ready)
+        {
+            self.splash = None;
+        }
+    }
+
+    /// Whether the first screen is all there for the splash to go: the
+    /// video shown, and its cover (or none to wait for).
+    fn first_screen_ready(&self) -> bool {
+        self.current()
+            .is_some_and(|video| match self.covers.get(&video.id) {
+                Some(Cover::Ready { encoded, .. }) => encoded.is_some(),
+                Some(Cover::Failed) => true,
+                Some(Cover::Loading) => false,
+                None => video.cover.is_none(),
+            })
+    }
+
+    /// How long until the next frame while something moves: the
+    /// animations, or the splash screen.
+    fn frame_in(&self) -> Option<Duration> {
+        let effects = self.effects.borrow();
+        let moving = effects.moving().then(|| effects.every());
+        let splash = self.splash.as_ref().map(crate::splash::Splash::every);
+        [moving, splash].into_iter().flatten().min()
     }
 
     /// The video shown, if there is one.
@@ -542,6 +669,15 @@ impl App {
     fn cover_size(&self) -> (u16, u16) {
         let area = ui::cover_area(self.video_area(), self.demo);
         (area.width, area.height)
+    }
+
+    /// Whether the terminal draws the covers as pictures (kitty's, sixel,
+    /// iTerm2's) rather than in colored half blocks: the animations leave
+    /// their cells be.
+    pub fn draws_pictures(&self) -> bool {
+        self.picker
+            .as_ref()
+            .is_some_and(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
     }
 
     /// Whether the terminal paints each picture over what's drawn on it
@@ -632,6 +768,8 @@ impl App {
         self.set_theme(settings.theme);
         self.volume = settings.volume;
         self.volume_kept = settings.volume;
+        self.pause_on_unplug = settings.pause_on_unplug;
+        self.animations = settings.animations;
         self.settings_in = save_in;
     }
 
@@ -650,14 +788,16 @@ impl App {
         self.playing.is_some() && self.playing.as_ref() == self.current().map(|v| &v.id)
     }
 
-    /// Whether that picture is in Pepper's box (not in mpv's window): not
-    /// while the `?` popup is open, or a box over the bottom line where it's
-    /// over the video, which they'd cover (as in tuitube).
+    /// Whether that picture is in Pepper's box (not in mpv's window), and
+    /// the splash screen isn't up over it. The `?` popup, or a box over the
+    /// bottom line where it's over the video, would be under it: where
+    /// Pepper takes holes they're cut in it for them, else it's taken away
+    /// while one is open (as in tuitube).
     pub fn picture_in_box(&self) -> bool {
         self.shows_picture()
             && self.token.is_some()
-            && self.help.is_none()
-            && !self.offers_cover_video()
+            && self.splash.is_none()
+            && (self.pepper_holes || (self.help.is_none() && !self.offers_cover_video()))
     }
 
     /// Whether a box over the bottom line (`/`'s categories, `:`'s commands)
@@ -672,7 +812,7 @@ impl App {
     pub fn command_offers(&self) -> Vec<&'static Spec> {
         self.command
             .as_ref()
-            .map_or_else(Vec::new, |line| completions(&line.text))
+            .map_or_else(Vec::new, |line| completions(line.typed.text()))
     }
 
     /// Whether the player was told to play the video shown and has no
@@ -886,6 +1026,10 @@ impl App {
                 self.want_covers();
             }
             AppEvent::Player { player, event } if player == self.players => self.on_player(event),
+            AppEvent::OutputGone(name) => self.on_output_gone(name),
+            AppEvent::OutputUnwatched(why) => {
+                self.output_watch = OutputWatch::Failed(text::one_line(&why, 200))
+            }
             AppEvent::Player { .. } => {}
         }
     }
@@ -1090,6 +1234,7 @@ impl App {
             return;
         }
         self.category = category;
+        self.held = None;
         if self.demo {
             return;
         }
@@ -1134,7 +1279,12 @@ impl App {
                 }
             }
             PlayerEvent::Restarted(entry) if self.entry == Some(entry) => {
+                // A new video's first frame: what plays shows over it a while.
+                let new = self.playing != self.loaded;
                 self.playing = self.loaded.clone();
+                if new {
+                    self.show_controls();
+                }
             }
             PlayerEvent::Position(entry, seconds) if self.entry == Some(entry) => {
                 self.position = seconds;
@@ -1152,7 +1302,17 @@ impl App {
             | PlayerEvent::Position(..)
             | PlayerEvent::Duration(..)
             | PlayerEvent::Failed(..) => {}
-            PlayerEvent::Paused(paused) => self.paused = paused,
+            // From paused to playing (space, or mpv's window): you played
+            // it, and nothing waits for the headphones any more.
+            PlayerEvent::Paused(paused) => {
+                if self.paused && !paused {
+                    self.held = None;
+                }
+                if self.paused != paused {
+                    self.show_controls();
+                }
+                self.paused = paused;
+            }
             // Changed in mpv's window too: the next video plays as loud.
             PlayerEvent::Volume(volume) => self.volume = volume.round().clamp(0.0, 100.0) as u32,
             PlayerEvent::Muted(muted) => self.muted = muted,
@@ -1210,16 +1370,53 @@ impl App {
         if !self.start_player() {
             return;
         }
+        // Paused if the headphones went since you last played something.
+        let paused = self.held.is_some();
         if let Some(player) = &self.player {
-            self.load = player.load(&target);
+            self.load = player.load(&target, paused);
         }
         self.entry = None;
         self.loaded = Some(id);
         self.playing = None;
         self.position = 0.0;
         self.duration = None;
-        self.paused = false;
+        self.paused = paused;
         self.play_error = None;
+        // From the first video played: what an unplug could pause.
+        self.watch_output();
+    }
+
+    /// Starts watching the sound's device (`crate::output`) the first time
+    /// something plays with `pause_on_unplug` on, for the rest of the run.
+    fn watch_output(&mut self) {
+        if self.output_watch == OutputWatch::Later
+            && self.pause_on_unplug
+            && let Some(tx) = self.tx.clone()
+        {
+            self.output_watch = OutputWatch::Watching;
+            crate::output::watch(tx);
+        }
+    }
+
+    /// The device playing the sound went (`name`): headphones unplugged, or
+    /// a Bluetooth one turned off. With `pause_on_unplug`, what plays
+    /// pauses, as on an iPhone, rather than go on from the speakers, and
+    /// what loads before you play something starts paused (`held`). One
+    /// paused already stays as it is.
+    fn on_output_gone(&mut self, name: String) {
+        if !self.pause_on_unplug || self.current().is_none() {
+            return;
+        }
+        let loaded = self.loaded.is_some() && self.loaded.as_ref() == self.current().map(|v| &v.id);
+        if loaded && self.paused {
+            return;
+        }
+        // Sent though mpv may be about to say it's paused: paused twice, it
+        // stays paused.
+        if loaded && let Some(player) = &self.player {
+            player.pause();
+        }
+        self.held = Some(name);
     }
 
     fn stop_playing(&mut self) {
@@ -1312,17 +1509,23 @@ impl App {
     }
 
     /// What to tell Pepper after a frame: the picture placed over the box
-    /// while the video shown plays (placed again when the box moves), taken
-    /// away otherwise. Empty when nothing changed, and always outside
-    /// Pepper (no token).
+    /// while the video shown plays, with holes where the frame drew over it
+    /// if Pepper takes them (placed again when the box or its holes
+    /// change), taken away otherwise. Empty when nothing changed, and always
+    /// outside Pepper (no token).
     fn placement(&mut self) -> String {
         let want = self
             .token
             .clone()
             .filter(|_| self.picture_in_box())
-            .map(|token| Placed {
-                token,
-                area: self.video_area(),
+            .map(|token| {
+                let area = self.video_area();
+                let holes = if self.pepper_holes {
+                    pepper::holes(area, &self.drawn_over.borrow())
+                } else {
+                    Vec::new()
+                };
+                Placed { token, area, holes }
             });
         if want == self.placed {
             return String::new();
@@ -1334,7 +1537,7 @@ impl App {
             out.push_str(&pepper::remove(&old.token));
         }
         if let Some(want) = &want {
-            out.push_str(&pepper::place(&want.token, want.area));
+            out.push_str(&pepper::place(&want.token, want.area, &want.holes));
         }
         self.placed = want;
         out
@@ -1601,7 +1804,10 @@ impl App {
 
     fn on_event(&mut self, event: Event) {
         match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.on_key(key);
+                self.show_controls();
+            }
             Event::Resize(columns, rows) => {
                 // A terminal that doesn't say keeps the size found before
                 // (by the picker, `set_picker`).
@@ -1624,11 +1830,11 @@ impl App {
             return;
         }
         if let Some(line) = self.command.as_mut() {
-            paste_into(&mut line.text, pasted, MAX_COMMAND);
+            paste_into(&mut line.typed, pasted, MAX_COMMAND);
             line.error = None;
         } else if let Some(search) = self.search.as_mut() {
-            paste_into(&mut search.text, pasted, MAX_SEARCH);
-            let offered = explore::matching(&search.text);
+            paste_into(&mut search.typed, pasted, MAX_SEARCH);
+            let offered = explore::matching(search.typed.text());
             search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
         } else {
             match links::parse(text::first_chars(pasted, links::MAX_LINK + 1)) {
@@ -1689,21 +1895,22 @@ impl App {
     /// `?`: the popup, on its keys tab, the settings' cursor on the theme in
     /// use.
     fn open_help(&mut self) {
-        let selected = theme::names()
+        let theme = theme::names()
             .iter()
             .position(|(id, _)| *id == self.theme)
             .unwrap_or(0);
         self.help = Some(HelpMenu {
             tab: HelpTab::Keys,
             scroll: Cell::new(0),
-            selected,
+            selected: HelpMenu::THEMES + theme,
             error: None,
         });
     }
 
     /// Keys while the `?` popup is open, as tuitube's: Tab (or `h` `l`, ←
     /// →) the other tab, `j` `k` scroll the keys or move the settings'
-    /// cursor, Enter or Space pick the theme under it, Esc, `q` or `?` close.
+    /// cursor, Enter or Space turn the setting under it on or off or pick
+    /// the theme under it, Esc, `q` or `?` close.
     fn on_help_key(&mut self, key: KeyEvent) {
         let Some(menu) = self.help.as_mut() else {
             return;
@@ -1721,8 +1928,14 @@ impl App {
                 return;
             }
             KeyCode::Enter | KeyCode::Char(' ') if menu.tab == HelpTab::Settings => {
-                let row = menu.selected;
-                self.pick_theme(row);
+                let saved = match menu.selected {
+                    HelpMenu::PAUSE_ON_UNPLUG => self.toggle_pause_on_unplug(),
+                    HelpMenu::ANIMATIONS => self.toggle_animations(),
+                    row => self.pick_theme(row - HelpMenu::THEMES),
+                };
+                if let Some(menu) = &mut self.help {
+                    menu.error = saved.err();
+                }
                 return;
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -1744,7 +1957,7 @@ impl App {
                 .scroll
                 .set(menu.scroll.get().saturating_add_signed(delta)),
             HelpTab::Settings => {
-                let last = theme::names().len() - 1;
+                let last = HelpMenu::THEMES + theme::names().len() - 1;
                 menu.selected = menu.selected.saturating_add_signed(delta).min(last);
             }
         }
@@ -1766,17 +1979,17 @@ impl App {
     /// Keys while the command line is open: what's typed narrows what it
     /// offers, with the cursor on the best match that isn't the feed shown;
     /// ↓ ↑ (or Tab, Ctrl-n Ctrl-p) move it, Enter shows what's under it,
-    /// Esc closes it; Backspace, Ctrl-w and Ctrl-u rub out as in a
-    /// shell.
+    /// Esc closes it; the rest edit the line at its cursor (`Typed::edit`:
+    /// ← → and Home End move it, Backspace, Ctrl-w and Ctrl-u rub out as in
+    /// a shell).
     fn on_search_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shown = self.category;
         let Some(search) = self.search.as_mut() else {
             return;
         };
-        let offered = explore::matching(&search.text);
+        let offered = explore::matching(search.typed.text());
         let last = offered.len().saturating_sub(1);
-        let typed = search.text.clone();
         match key.code {
             KeyCode::Esc => self.search = None,
             KeyCode::Enter => {
@@ -1790,14 +2003,11 @@ impl App {
             KeyCode::Up | KeyCode::BackTab => search.selected = search.selected.saturating_sub(1),
             KeyCode::Char('p') if ctrl => search.selected = search.selected.saturating_sub(1),
             _ => {
-                edit_line(&mut search.text, key, MAX_SEARCH);
+                if search.typed.edit(&key, MAX_SEARCH) {
+                    let offered = explore::matching(search.typed.text());
+                    search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+                }
             }
-        }
-        if let Some(search) = self.search.as_mut()
-            && search.text != typed
-        {
-            let offered = explore::matching(&search.text);
-            search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
         }
     }
 
@@ -1812,13 +2022,13 @@ impl App {
             KeyCode::Esc => self.command = None,
             KeyCode::Enter => self.run_command(),
             KeyCode::Tab => {
-                if let Some(spec) = completions(&line.text).first() {
-                    line.text = format!("{} ", spec.name);
+                if let Some(spec) = completions(line.typed.text()).first() {
+                    line.typed = Typed::new(format!("{} ", spec.name));
                     line.error = None;
                 }
             }
             _ => {
-                if edit_line(&mut line.text, key, MAX_COMMAND) {
+                if line.typed.edit(&key, MAX_COMMAND) {
                     line.error = None;
                 }
             }
@@ -1832,7 +2042,7 @@ impl App {
         let Some(line) = self.command.as_mut() else {
             return;
         };
-        let text = line.text.trim();
+        let text = line.typed.text().trim();
         let (name, arg) = text
             .split_once(' ')
             .map_or((text, ""), |(name, arg)| (name, arg.trim()));
@@ -1857,17 +2067,35 @@ impl App {
         }
     }
 
-    /// Enter or Space on the settings tab: the theme on `row` in use, and
-    /// saved at once; why not, if it can't be.
-    fn pick_theme(&mut self, row: usize) {
-        let Some((id, _)) = theme::names().get(row) else {
-            return;
+    /// The theme `n`th in `theme::names()` in use, and saved at once; why
+    /// not, if it can't be.
+    fn pick_theme(&mut self, n: usize) -> Result<(), String> {
+        let Some((id, _)) = theme::names().get(n) else {
+            return Ok(());
         };
         self.set_theme(id);
-        let saved = self.save_theme();
-        if let Some(menu) = &mut self.help {
-            menu.error = saved.err();
+        self.save_setting("theme", self.theme.into())
+    }
+
+    /// Pausing when the headphones are unplugged on or off, saved at once.
+    /// Turned on, what plays now is watched too; off, nothing waits for
+    /// them any more.
+    fn toggle_pause_on_unplug(&mut self) -> Result<(), String> {
+        self.pause_on_unplug = !self.pause_on_unplug;
+        if self.pause_on_unplug {
+            if self.loaded.is_some() {
+                self.watch_output();
+            }
+        } else {
+            self.held = None;
         }
+        self.save_setting("pause_on_unplug", self.pause_on_unplug.into())
+    }
+
+    /// The animations on or off, saved at once.
+    fn toggle_animations(&mut self) -> Result<(), String> {
+        self.animations = !self.animations;
+        self.save_setting("animations", self.animations.into())
     }
 
     /// `-` and `+`: how loud, in percent, what plays and what plays next,
@@ -1900,13 +2128,12 @@ impl App {
         }
     }
 
-    /// Keeps the theme in use in settings.toml, if there's a folder for it.
-    fn save_theme(&self) -> Result<(), String> {
+    /// Keeps `key` as `value` in settings.toml, if there's a folder for it.
+    fn save_setting(&self, key: &str, value: toml::Value) -> Result<(), String> {
         let Some(data) = &self.settings_in else {
             return Ok(());
         };
-        settings::save(data, "theme", self.theme.into())
-            .map_err(|e| text::one_line(&format!("{e:#}"), 200))
+        settings::save(data, key, value).map_err(|e| text::one_line(&format!("{e:#}"), 200))
     }
 
     /// `act` on the player, while it shows the video shown.
@@ -1929,10 +2156,41 @@ impl App {
         }
     }
 
+    /// Pepper's full screen (`f`), in a Pepper that takes holes, while its
+    /// picture's there: what plays can show over it, as TikTok's app shows
+    /// the author and caption (an older Pepper's picture would cover it).
+    fn has_controls(&self) -> bool {
+        self.pepper_holes && self.fullscreen && self.picture_in_box()
+    }
+
+    /// Something was done: where there are controls (`has_controls`), they
+    /// show for `CONTROLS_FOR`.
+    fn show_controls(&mut self) {
+        if self.has_controls() {
+            self.controls_until = Some(Instant::now() + CONTROLS_FOR);
+        }
+    }
+
+    /// Whether what plays shows over Pepper's full screen at `now`: where
+    /// there are controls, for a while after anything's done
+    /// (`show_controls`), and all the while it's paused.
+    pub fn shows_controls(&self, now: Instant) -> bool {
+        self.has_controls() && (self.paused || self.controls_until.is_some_and(|until| now < until))
+    }
+
+    /// How long until the controls hide, while they show for a while.
+    fn controls_hide_in(&self, now: Instant) -> Option<Duration> {
+        self.controls_until
+            .map(|until| until.saturating_duration_since(now))
+            .filter(|left| !left.is_zero() && self.has_controls())
+    }
+
     /// Shows the video `by` from this one, within the feed. A key asks, so a
     /// player that ended by itself starts again.
     fn go(&mut self, by: isize) {
         self.player_gone = false;
+        // You picked a video: it plays, the headphones gone or not.
+        self.held = None;
         if self.videos.is_empty() {
             self.refill();
             return;
@@ -1985,49 +2243,18 @@ impl App {
     }
 }
 
-/// A key on a line being typed (`/`'s or `:`'s), as in a shell: Backspace
-/// (or Ctrl-h) rubs out a character, Ctrl-w a word, Ctrl-u the line; a
-/// character is typed unless it's hidden (`text::is_hidden`) or the line
-/// has `max`. Whether the key was one of these.
-fn edit_line(text: &mut String, key: KeyEvent, max: usize) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Backspace => {
-            text.pop();
-        }
-        KeyCode::Char('h') if ctrl => {
-            text.pop();
-        }
-        KeyCode::Char('u') if ctrl => text.clear(),
-        KeyCode::Char('w') if ctrl => {
-            let kept = text.trim_end().len();
-            text.truncate(kept);
-            let cut = text.rfind(' ').map_or(0, |i| i + 1);
-            text.truncate(cut);
-        }
-        KeyCode::Char(c) if !ctrl && !text::is_hidden(c) && text.chars().count() < max => {
-            text.push(c);
-        }
-        _ => return false,
-    }
-    true
-}
-
-/// `pasted` added to a line being typed, as one line (`text::one_line`),
-/// up to `max` characters in all.
-fn paste_into(line: &mut String, pasted: &str, max: usize) {
+/// `pasted` put in a line being typed, at its cursor, as one line
+/// (`text::one_line`), up to `max` characters in all; a space it had at
+/// either end is kept where a word would run into it otherwise
+/// (`Typed::paste`).
+fn paste_into(line: &mut Typed, pasted: &str, max: usize) {
     // A paste can be any size: cut before it's cleaned.
-    let pasted = text::first_chars(pasted, 4 * max);
-    // A space it starts with stays, so it isn't run into the word before.
-    if pasted.starts_with(char::is_whitespace)
-        && !line.is_empty()
-        && !line.ends_with(' ')
-        && line.chars().count() < max
-    {
-        line.push(' ');
-    }
-    let room = max.saturating_sub(line.chars().count());
-    line.push_str(&text::one_line(pasted, room));
+    let clean = text::clean(text::first_chars(pasted, 4 * max));
+    let spaced = (
+        clean.starts_with(char::is_whitespace),
+        clean.ends_with(char::is_whitespace),
+    );
+    line.paste(&text::one_line(&clean, max), spaced, max);
 }
 
 /// Writes tuitok's own sequences to the terminal, after ratatui's frame.
@@ -2394,11 +2621,11 @@ pub mod tests {
         assert_eq!(app.placement(), "");
         set_playing(&mut app, "1", true);
         let area = app.video_area();
-        assert_eq!(app.placement(), pepper::place("t0k", area));
+        assert_eq!(app.placement(), pepper::place("t0k", area, &[]));
         assert_eq!(app.placement(), "");
         // The window grew: placed again.
         app.size = (150, 50);
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
         // Another video shown, not playing yet: taken away.
         app.at = 1;
         assert_eq!(app.placement(), pepper::remove("t0k"));
@@ -2549,7 +2776,7 @@ pub mod tests {
         let menu = app.help.as_ref().unwrap();
         assert_eq!(menu.tab, HelpTab::Keys);
         assert_eq!(
-            theme::names()[menu.selected].0,
+            theme::names()[menu.selected - HelpMenu::THEMES].0,
             "nord",
             "on the theme in use"
         );
@@ -2575,13 +2802,58 @@ pub mod tests {
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(
             app.help.as_ref().unwrap().selected,
-            theme::names().len() - 1
+            HelpMenu::THEMES + theme::names().len() - 1
         );
+        // The settings above the themes: on or off, saved at once.
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(
+            app.help.as_ref().unwrap().selected,
+            HelpMenu::PAUSE_ON_UNPLUG
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.pause_on_unplug && !app.animations);
+        let saved = settings::load(&data);
+        assert!(!saved.pause_on_unplug && !saved.animations);
+        assert_eq!(saved.theme, before_nord, "the rest kept");
         // q closes it, and doesn't quit; it kept what was picked.
         press(&mut app, KeyCode::Char('q'));
         assert!(app.help.is_none() && !app.quit);
         assert_eq!(app.theme, before_nord);
         std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn what_plays_pauses_when_the_headphones_are_unplugged() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        let gone = |app: &mut App| app.on_app_event(AppEvent::OutputGone("AirPods".into()));
+        // Nothing shown yet, or it's off: nothing.
+        app.pause_on_unplug = false;
+        set_playing(&mut app, "1", true);
+        gone(&mut app);
+        assert_eq!(app.held, None, "off");
+        app.pause_on_unplug = true;
+        gone(&mut app);
+        assert_eq!(app.held.as_deref(), Some("AirPods"));
+        // Paused, then played by you (space, or mpv's window): nothing waits.
+        app.on_player(PlayerEvent::Paused(true));
+        app.on_player(PlayerEvent::Paused(false));
+        assert_eq!(app.held, None);
+        // Paused already: it stays as it is, and nothing waits.
+        app.on_player(PlayerEvent::Paused(true));
+        gone(&mut app);
+        assert_eq!(app.held, None);
+        // j: you picked the next, which plays.
+        app.on_player(PlayerEvent::Paused(false));
+        gone(&mut app);
+        assert!(app.held.is_some());
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.held, None);
+        // Gone while the one shown loads: it starts paused.
+        app.loaded = None;
+        gone(&mut app);
+        assert!(app.held.is_some());
     }
 
     #[test]
@@ -2591,8 +2863,8 @@ pub mod tests {
             .join(format!("target/test-app-volume-{}", std::process::id()));
         crate::config::private_dir(&data).unwrap();
         let at = |volume| Settings {
-            theme: theme::DEFAULT,
             volume,
+            ..Settings::default()
         };
         app.use_settings(at(100), Some(data.clone()));
         // Unchanged: nothing written.
@@ -2637,7 +2909,7 @@ pub mod tests {
     fn slash_opens_the_bar_and_typing_narrows_it() {
         let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
         set_playing(&mut app, "1", true);
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
         press(&mut app, KeyCode::Char('/'));
         assert_eq!(app.search, Some(Search::default()), "the cursor on For You");
         // Its box is over the panel: the video plays on beside it.
@@ -2657,7 +2929,7 @@ pub mod tests {
             press(&mut app, KeyCode::Char(c));
         }
         assert_eq!((app.at, app.quit), (0, false));
-        assert_eq!(app.search.as_ref().unwrap().text, "jq");
+        assert_eq!(app.search.as_ref().unwrap().typed.text(), "jq");
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         for c in "com".chars() {
             press(&mut app, KeyCode::Char(c));
@@ -2667,7 +2939,7 @@ pub mod tests {
         press(&mut app, KeyCode::Down);
         let search = app.search.as_ref().unwrap();
         assert_eq!(
-            (search.text.as_str(), search.selected),
+            (search.typed.text(), search.selected),
             ("com", 1),
             "Comedy, Anime & Comics"
         );
@@ -2677,7 +2949,7 @@ pub mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.search.is_none() && !app.quit);
         assert_eq!((app.category, app.videos.len()), (None, 2));
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
     }
 
     #[tokio::test]
@@ -2778,16 +3050,79 @@ pub mod tests {
     }
 
     #[test]
-    fn the_popup_takes_the_picture_away() {
+    fn the_popup_takes_the_picture_away_in_a_pepper_without_holes() {
         let mut app = app_with(vec![crate::ui::tests::video("1")]);
         set_playing(&mut app, "1", true);
         let area = app.video_area();
-        assert_eq!(app.placement(), pepper::place("t0k", area));
+        assert_eq!(app.placement(), pepper::place("t0k", area, &[]));
         press(&mut app, KeyCode::Char('?'));
         assert!(!app.picture_in_box());
         assert_eq!(app.placement(), pepper::remove("t0k"));
         press(&mut app, KeyCode::Esc);
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
+    }
+
+    #[test]
+    fn in_peppers_full_screen_what_plays_shows_a_while_after_anything() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        set_playing(&mut app, "1", true);
+        let key = |app: &mut App, c| {
+            app.on_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        };
+        // Not in its box, or a Pepper without holes: nothing.
+        app.pepper = true;
+        key(&mut app, 'f');
+        assert!(app.fullscreen && app.controls_until.is_none());
+        app.pepper_holes = true;
+        key(&mut app, 'm');
+        let now = Instant::now();
+        assert!(app.shows_controls(now));
+        let hide_in = app.controls_hide_in(now).unwrap();
+        assert!(hide_in <= CONTROLS_FOR && hide_in > CONTROLS_FOR / 2);
+        assert!(!app.shows_controls(now + CONTROLS_FOR), "gone in 3 s");
+        // Paused: all the while; and a pause or play shows them again.
+        app.controls_until = None;
+        app.on_player(PlayerEvent::Paused(true));
+        assert!(app.controls_until.is_some());
+        assert!(app.shows_controls(now + 2 * CONTROLS_FOR));
+        // A new video's first frame shows them.
+        app.on_player(PlayerEvent::Paused(false));
+        app.controls_until = None;
+        (app.loaded, app.entry) = (Some(VideoId::new("2").unwrap()), Some(7));
+        app.at = 1;
+        app.on_player(PlayerEvent::Restarted(7));
+        assert!(app.controls_until.is_some());
+        // Out of full screen: none.
+        key(&mut app, 'f');
+        assert!(!app.shows_controls(now));
+    }
+
+    #[test]
+    fn where_pepper_takes_holes_the_picture_plays_on_around_a_popup() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        set_playing(&mut app, "1", true);
+        app.pepper_holes = true;
+        let area = app.video_area();
+        assert_eq!(app.placement(), pepper::place("t0k", area, &[]));
+        // The `?` popup: a hole where it's over the box, cut to it.
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.picture_in_box());
+        let popup = Rect::new(area.x - 5, area.y + 2, area.width + 10, 6);
+        app.drawn_over.replace(vec![popup]);
+        let hole = Rect::new(area.x, area.y + 2, area.width, 6);
+        assert_eq!(app.placement(), pepper::place("t0k", area, &[hole]));
+        assert_eq!(app.placement(), "", "said once");
+        // Closed: whole again.
+        press(&mut app, KeyCode::Esc);
+        app.drawn_over.replace(Vec::new());
+        assert_eq!(app.placement(), pepper::place("t0k", area, &[]));
+        // `/`'s box over the video's side, with no panel: it plays on too.
+        app.size = (80, 40);
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.offers_cover_video() && app.picture_in_box());
     }
 
     #[test]
@@ -2848,7 +3183,7 @@ pub mod tests {
         assert_eq!(app.command_offers(), [&COMMANDS[0]]);
         // Its box is over the panel: the video plays on beside it; with no
         // panel, over the video, which is taken away.
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
         app.size = (80, 40);
         assert_eq!(app.placement(), pepper::remove("t0k"));
         // While it's open, keys are typed: j doesn't move, q doesn't quit.
@@ -2863,8 +3198,8 @@ pub mod tests {
         assert_eq!(error(&app), None);
         press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.command.as_ref().unwrap().text, "open ");
-        assert_eq!(app.placement(), pepper::place("t0k", app.video_area()));
+        assert_eq!(app.command.as_ref().unwrap().typed.text(), "open ");
+        assert_eq!(app.placement(), pepper::place("t0k", app.video_area(), &[]));
         press(&mut app, KeyCode::Enter);
         assert_eq!(error(&app).as_deref(), Some("open needs a link"));
         type_in(
@@ -2874,7 +3209,7 @@ pub mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(error(&app).as_deref(), Some("Not a TikTok video's link"));
         app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.command.as_ref().unwrap().text, "open ");
+        assert_eq!(app.command.as_ref().unwrap().typed.text(), "open ");
         type_in(&mut app, "vt.tiktok.com/ZSe4FqkKd");
         press(&mut app, KeyCode::Enter);
         assert!(app.command.is_none());
@@ -3003,6 +3338,35 @@ pub mod tests {
     }
 
     #[test]
+    fn the_lines_edit_at_their_cursor() {
+        let mut app = app_with(vec![crate::ui::tests::video("1")]);
+        let typed = |app: &App| app.command.as_ref().unwrap().typed.text().to_owned();
+        press(&mut app, KeyCode::Char(':'));
+        type_in(&mut app, "opn");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(typed(&app), "open");
+        // A paste goes in at the cursor too, apart from the word after it.
+        press(&mut app, KeyCode::Home);
+        app.on_event(Event::Paste("x ".into()));
+        assert_eq!(typed(&app), "x open");
+        press(&mut app, KeyCode::Esc);
+        // `/`: ← and → move the cursor, not the row under it.
+        press(&mut app, KeyCode::Char('/'));
+        type_in(&mut app, "fd");
+        let selected = app.search.as_ref().unwrap().selected;
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.search.as_ref().unwrap().selected, selected);
+        type_in(&mut app, "oo");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.typed.text(), "food");
+        assert_eq!(
+            explore::name(explore::matching("food")[search.selected]),
+            "Food"
+        );
+    }
+
+    #[test]
     fn a_paste_goes_into_the_line_open_else_a_link_opens() {
         let mut app = app_with(vec![crate::ui::tests::video("1")]);
         let paste = |app: &mut App, text: &str| app.on_event(Event::Paste(text.into()));
@@ -3023,15 +3387,18 @@ pub mod tests {
         press(&mut app, KeyCode::Char(':'));
         type_in(&mut app, "open");
         paste(&mut app, " a\nb\u{1b}c");
-        assert_eq!(app.command.as_ref().unwrap().text, "open a bc");
+        assert_eq!(app.command.as_ref().unwrap().typed.text(), "open a bc");
         paste(&mut app, &"x".repeat(3 * MAX_COMMAND));
-        assert_eq!(app.command.as_ref().unwrap().text.len(), MAX_COMMAND);
+        assert_eq!(
+            app.command.as_ref().unwrap().typed.text().len(),
+            MAX_COMMAND
+        );
         press(&mut app, KeyCode::Esc);
         // Into `/`'s, narrowing it.
         press(&mut app, KeyCode::Char('/'));
         paste(&mut app, "foo");
         let search = app.search.as_ref().unwrap();
-        assert_eq!(search.text, "foo");
+        assert_eq!(search.typed.text(), "foo");
         assert_eq!(
             explore::name(explore::matching("foo")[search.selected]),
             "Food"
