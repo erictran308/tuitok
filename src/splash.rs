@@ -87,6 +87,14 @@ impl Splash {
             .is_none_or(|leaving| now.saturating_duration_since(leaving) < OUT)
     }
 
+    /// Starts fading out at `now`, if it isn't yet (a key was pressed):
+    /// whether it was up till then.
+    pub fn leave(&mut self, now: Instant) -> bool {
+        let up = self.leaving.is_none();
+        self.leaving.get_or_insert(now);
+        up
+    }
+
     /// How long until the next frame.
     pub fn every(&self) -> Duration {
         if self.leaving.is_some() {

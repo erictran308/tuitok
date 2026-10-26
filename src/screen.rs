@@ -74,8 +74,9 @@ pub fn task_panic() -> Option<&'static str> {
 /// stays and tuitok quits as with q (SIGTERM, which `App::run` takes so):
 /// the player quits, Pepper's box goes, and why is said after. The event
 /// loop's own (on the main thread) hands the terminal back at once and says
-/// why without control characters (it can quote a caption), then unwinds,
-/// so the browser is still killed as its `Drop` does.
+/// why without control characters (it can quote a caption), with the
+/// backtrace `RUST_BACKTRACE` asks for, then unwinds, so the browser is
+/// still killed as its `Drop` does.
 fn set_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if crate::covers::panic_is_contained() {
@@ -96,6 +97,12 @@ fn set_panic_hook() {
             "tuitok crashed: {}",
             text::one_line(&info.to_string(), 400)
         );
+        // As the default hook prints it: tuitok's own code's names and
+        // places, nothing from TikTok.
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            let _ = writeln!(std::io::stderr(), "{backtrace}");
+        }
     }));
 }
 

@@ -265,6 +265,11 @@ impl Player {
         self.command(json!(["set_property", "pause", true]));
     }
 
+    /// Plays, if it's paused: never pauses.
+    pub fn play(&self) {
+        self.command(json!(["set_property", "pause", false]));
+    }
+
     /// Sets the volume, in percent.
     pub fn set_volume(&self, percent: u32) {
         self.command(json!(["set_property", "volume", percent.min(100)]));

@@ -246,6 +246,14 @@ pub struct Search {
     pub selected: usize,
     pub scroll: Cell<usize>,
 }
+impl Search {
+    /// The cursor on the best match for what's typed that isn't the feed
+    /// `shown`, as it changes (typed or pasted).
+    fn reselect(&mut self, shown: Option<Category>) {
+        let offered = explore::matching(self.typed.text());
+        self.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+    }
+}
 
 /// The command line `:` opens, as tuitube's: what's typed, and why the line
 /// Enter ran couldn't run (until it's edited).
@@ -418,9 +426,11 @@ pub struct App {
     picker: Option<Picker>,
     cover_client: Option<reqwest::Client>,
     /// Top comments by video, and the client for `www.tiktok.com`: its
-    /// comment list, and Explore's pages.
+    /// comment list, Explore's pages and a video's page; and the one that
+    /// asks a short link where it leads, following no redirect.
     pub comments: HashMap<VideoId, Comments>,
     www_client: Option<reqwest::Client>,
+    short_client: Option<reqwest::Client>,
     /// `f` in Pepper: the video fills the tab; and, where Pepper takes
     /// holes, when what plays stops showing over it (`shows_controls`): for
     /// `CONTROLS_FOR` after anything's done.
@@ -516,6 +526,7 @@ impl App {
             cover_client: None,
             comments: HashMap::new(),
             www_client: None,
+            short_client: None,
             fullscreen: false,
             controls_until: None,
             demo: false,
@@ -539,6 +550,7 @@ impl App {
             self.client = Some(cache::client(crate::video::video_url_allowed));
             self.cover_client = Some(cache::client(crate::video::image_url_allowed));
             self.www_client = Some(cache::client(crate::video::www_url_allowed));
+            self.short_client = Some(cache::client(|_| false));
         }
         self.want_covers();
         self.want_comments();
@@ -818,9 +830,14 @@ impl App {
     /// Whether the player was told to play the video shown and has no
     /// frame of it yet.
     pub fn loading(&self) -> bool {
-        self.loaded.is_some()
-            && self.loaded.as_ref() == self.current().map(|v| &v.id)
-            && !self.shows_picture()
+        self.loads_shown() && !self.shows_picture()
+    }
+
+    /// Whether the player was told to play the video shown.
+    fn loads_shown(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .is_some_and(|id| Some(id) == self.current().map(|v| &v.id))
     }
 
     /// Starts fetching more of the feed shown, unless that's under way.
@@ -1139,21 +1156,26 @@ impl App {
         }
         self.links_opened += 1;
         self.link = Some(LinkState::Opening);
-        let (Some(client), Some(tx)) = (self.www_client.clone(), self.tx.clone()) else {
+        let (Some(client), Some(short_client), Some(tx)) = (
+            self.www_client.clone(),
+            self.short_client.clone(),
+            self.tx.clone(),
+        ) else {
             return;
         };
         let number = self.links_opened;
         tokio::spawn(async move {
-            let video = links::fetch(&client, link)
+            let video = links::fetch(&client, &short_client, link)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::Opened { number, video });
         });
     }
 
-    /// The video a link is to came: it's shown next. Or it didn't, and the
-    /// status line says why. Then the feed is fetched if it wants more
-    /// (after `tuitok LINK`, it waited for this).
+    /// The video a link is to came: it's shown next (`go` fetches more of
+    /// the feed if it wants it). Or it didn't, and the status line says
+    /// why; then the feed is fetched if it wants more (after `tuitok LINK`,
+    /// it waited for this).
     fn on_opened(&mut self, video: Result<Video, String>) {
         match video {
             Ok(video) => {
@@ -1163,9 +1185,9 @@ impl App {
             Err(e) => {
                 let why = text::one_line(&e, 300);
                 self.link = Some(LinkState::Failed(format!("The link failed: {why}")));
+                self.refill();
             }
         }
-        self.refill();
     }
 
     /// Shows `video` where `j` goes from the one shown, so `k` goes back to
@@ -1401,19 +1423,18 @@ impl App {
     /// The device playing the sound went (`name`): headphones unplugged, or
     /// a Bluetooth one turned off. With `pause_on_unplug`, what plays
     /// pauses, as on an iPhone, rather than go on from the speakers, and
-    /// what loads before you play something starts paused (`held`). One
-    /// paused already stays as it is.
+    /// what loads before you play something starts paused (`held`): also
+    /// with nothing shown yet, or the video shown paused already, as
+    /// tuitube's.
     fn on_output_gone(&mut self, name: String) {
-        if !self.pause_on_unplug || self.current().is_none() {
+        if !self.pause_on_unplug {
             return;
         }
-        let loaded = self.loaded.is_some() && self.loaded.as_ref() == self.current().map(|v| &v.id);
-        if loaded && self.paused {
-            return;
-        }
-        // Sent though mpv may be about to say it's paused: paused twice, it
-        // stays paused.
-        if loaded && let Some(player) = &self.player {
+        // Sent though mpv may have said it's paused: it may be about to
+        // answer a space that plays it. Paused twice, it stays paused.
+        if self.loads_shown()
+            && let Some(player) = &self.player
+        {
             player.pause();
         }
         self.held = Some(name);
@@ -1803,6 +1824,26 @@ impl App {
     }
 
     fn on_event(&mut self, event: Event) {
+        // Under the splash screen nothing's seen: a key or a paste takes it
+        // away and does nothing else, but quit (q, Ctrl-C). Once it fades,
+        // keys work.
+        if let Some(splash) = &mut self.splash
+            && matches!(
+                &event,
+                Event::Key(KeyEvent {
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) | Event::Paste(_)
+            )
+            && splash.leave(Instant::now())
+        {
+            if let Event::Key(key) = &event
+                && (key.code == KeyCode::Char('q') || ctrl_c(key))
+            {
+                self.quit = true;
+            }
+            return;
+        }
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 self.on_key(key);
@@ -1834,8 +1875,7 @@ impl App {
             line.error = None;
         } else if let Some(search) = self.search.as_mut() {
             paste_into(&mut search.typed, pasted, MAX_SEARCH);
-            let offered = explore::matching(search.typed.text());
-            search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+            search.reselect(shown);
         } else {
             match links::parse(text::first_chars(pasted, links::MAX_LINK + 1)) {
                 Some(link) => self.open_link(link),
@@ -1850,7 +1890,7 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if ctrl_c(&key) {
             self.quit = true;
             return;
         }
@@ -1874,7 +1914,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.go(1),
             KeyCode::Char('k') | KeyCode::Up => self.go(-1),
-            KeyCode::Char(' ') => self.with_player(Player::toggle_pause),
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('m') => self.set_muted(!self.muted),
             KeyCode::Char('-') => self.set_volume(self.volume.saturating_sub(VOLUME_STEP)),
             KeyCode::Char('+' | '=') => self.set_volume(self.volume + VOLUME_STEP),
@@ -2004,8 +2044,7 @@ impl App {
             KeyCode::Char('p') if ctrl => search.selected = search.selected.saturating_sub(1),
             _ => {
                 if search.typed.edit(&key, MAX_SEARCH) {
-                    let offered = explore::matching(search.typed.text());
-                    search.selected = offered.iter().position(|c| *c != shown).unwrap_or(0);
+                    search.reselect(shown);
                 }
             }
         }
@@ -2145,6 +2184,22 @@ impl App {
         }
     }
 
+    /// Space: pauses or plays the video shown. While what loads waits for
+    /// you since the headphones went (`held`), it plays on: the video shown
+    /// loading too, or once it can load.
+    fn toggle_pause(&mut self) {
+        if self.shows_picture() {
+            self.with_player(Player::toggle_pause);
+            return;
+        }
+        if self.held.take().is_some()
+            && self.loads_shown()
+            && let Some(player) = &self.player
+        {
+            player.play();
+        }
+    }
+
     /// `f`: in Pepper the video fills the tab, or goes back to its box;
     /// elsewhere mpv's window goes full screen.
     fn toggle_fullscreen(&mut self) {
@@ -2248,13 +2303,20 @@ impl App {
 /// either end is kept where a word would run into it otherwise
 /// (`Typed::paste`).
 fn paste_into(line: &mut Typed, pasted: &str, max: usize) {
-    // A paste can be any size: cut before it's cleaned.
-    let clean = text::clean(text::first_chars(pasted, 4 * max));
+    // A paste can be any size: cut before it's cleaned. Its line breaks
+    // may come as \r, a control character `clean` drops: a space between
+    // the lines, as \n is.
+    let clean = text::clean(&text::first_chars(pasted, 4 * max).replace('\r', "\n"));
     let spaced = (
         clean.starts_with(char::is_whitespace),
         clean.ends_with(char::is_whitespace),
     );
     line.paste(&text::one_line(&clean, max), spaced, max);
+}
+
+/// Ctrl-C: tuitok quits, whatever is open.
+fn ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Writes tuitok's own sequences to the terminal, after ratatui's frame.
@@ -2828,7 +2890,7 @@ pub mod tests {
     fn what_plays_pauses_when_the_headphones_are_unplugged() {
         let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
         let gone = |app: &mut App| app.on_app_event(AppEvent::OutputGone("AirPods".into()));
-        // Nothing shown yet, or it's off: nothing.
+        // Off: nothing.
         app.pause_on_unplug = false;
         set_playing(&mut app, "1", true);
         gone(&mut app);
@@ -2840,20 +2902,26 @@ pub mod tests {
         app.on_player(PlayerEvent::Paused(true));
         app.on_player(PlayerEvent::Paused(false));
         assert_eq!(app.held, None);
-        // Paused already: it stays as it is, and nothing waits.
+        // Paused already, or about to play (mpv not yet said so): paused,
+        // and what loads next waits too.
         app.on_player(PlayerEvent::Paused(true));
         gone(&mut app);
-        assert_eq!(app.held, None);
-        // j: you picked the next, which plays.
-        app.on_player(PlayerEvent::Paused(false));
-        gone(&mut app);
         assert!(app.held.is_some());
+        // j: you picked the next, which plays.
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.held, None);
-        // Gone while the one shown loads: it starts paused.
+        // Gone while the one shown loads: it starts paused, until space.
         app.loaded = None;
+        app.playing = None;
         gone(&mut app);
         assert!(app.held.is_some());
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.held, None, "space plays on");
+        // With nothing shown yet (the first batch, a category picked), what
+        // comes first waits.
+        let mut empty = app_with(Vec::new());
+        gone(&mut empty);
+        assert!(empty.held.is_some());
     }
 
     #[test]
@@ -3338,6 +3406,34 @@ pub mod tests {
     }
 
     #[test]
+    fn keys_under_the_splash_screen_only_take_it_away_or_quit() {
+        let mut app = app_with(["1", "2"].map(crate::ui::tests::video).to_vec());
+        let key = |app: &mut App, c: char| {
+            app.on_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        };
+        app.keep_splash(Instant::now());
+        key(&mut app, 'j');
+        assert_eq!(app.at, 0);
+        assert!(app.splash.is_some(), "fading out");
+        // Once it fades, keys work.
+        key(&mut app, 'j');
+        assert_eq!(app.at, 1);
+        // A paste takes it away too, and opens nothing.
+        let mut pasted = app_with(Vec::new());
+        pasted.keep_splash(Instant::now());
+        pasted.on_event(Event::Paste("7657182246486478098".into()));
+        assert_eq!(pasted.links_opened, 0);
+        // q quits.
+        let mut quitting = app_with(Vec::new());
+        quitting.keep_splash(Instant::now());
+        key(&mut quitting, 'q');
+        assert!(quitting.quit);
+    }
+
+    #[test]
     fn the_lines_edit_at_their_cursor() {
         let mut app = app_with(vec![crate::ui::tests::video("1")]);
         let typed = |app: &App| app.command.as_ref().unwrap().typed.text().to_owned();
@@ -3392,6 +3488,15 @@ pub mod tests {
         assert_eq!(
             app.command.as_ref().unwrap().typed.text().len(),
             MAX_COMMAND
+        );
+        press(&mut app, KeyCode::Esc);
+        // Lines pasted, their breaks \r as many terminals send them: one
+        // line, a space between.
+        press(&mut app, KeyCode::Char(':'));
+        paste(&mut app, "open\rhttps://vt.tiktok.com/ZSe4FqkKd");
+        assert_eq!(
+            app.command.as_ref().unwrap().typed.text(),
+            "open https://vt.tiktok.com/ZSe4FqkKd"
         );
         press(&mut app, KeyCode::Esc);
         // Into `/`'s, narrowing it.

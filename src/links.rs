@@ -26,6 +26,10 @@ use crate::video::{self, Video, VideoId};
 pub const MAX_LINK: usize = 2_000;
 /// The longest short link code taken (TikTok's are 9).
 const MAX_CODE: usize = 32;
+/// The fewest digits of a video's id alone: TikTok's ids hold when they
+/// were made in their top 32 bits, 19 digits since 2016 (20 from 2043), so
+/// a stray number pasted isn't taken for one.
+const BARE_ID: usize = 19;
 /// The biggest video page read: they were 416 to 432 KB.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 /// How long a request may take (one page took 6.7 s).
@@ -44,15 +48,17 @@ pub enum Link {
 /// on `www.`, `m.` or no host prefix, `m.tiktok.com/v/ID.html`,
 /// `/embed/ID`, `/embed/v2/ID`, `/player/v1/ID`; the short
 /// `vm.tiktok.com/CODE`, `vt.tiktok.com/CODE` and `tiktok.com/t/CODE`; with
-/// or without `https://`; or a video's id alone. Not photo posts, which
-/// have no video.
+/// or without `https://`; or a video's id alone (at least `BARE_ID`
+/// digits). Not photo posts, which have no video.
 pub fn parse(text: &str) -> Option<Link> {
     let text = text.trim();
     if text.len() > MAX_LINK || text.chars().any(char::is_whitespace) {
         return None;
     }
-    if let Some(id) = VideoId::new(text) {
-        return Some(Link::Video(id));
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        return VideoId::new(text)
+            .filter(|_| text.len() >= BARE_ID)
+            .map(Link::Video);
     }
     let with_scheme = if text.contains("://") {
         text.to_owned()
@@ -97,11 +103,16 @@ pub fn page_url(id: &VideoId) -> String {
 
 /// The video `link` is to, read from its page with `client` (TikTok's
 /// `www` host only), with the `tt_chain_token` its page set: a new guest
-/// each time, sent no cookie.
-pub async fn fetch(client: &reqwest::Client, link: Link) -> Result<Video> {
+/// each time, sent no cookie. A short link is asked where it leads with
+/// `short_client`, which follows no redirect (`cache::client(|_| false)`).
+pub async fn fetch(
+    client: &reqwest::Client,
+    short_client: &reqwest::Client,
+    link: Link,
+) -> Result<Video> {
     let id = match link {
         Link::Video(id) => id,
-        Link::Short(url) => resolve(&url).await?,
+        Link::Short(url) => resolve(short_client, &url).await?,
     };
     let response = client
         .get(page_url(&id))
@@ -122,9 +133,10 @@ pub async fn fetch(client: &reqwest::Client, link: Link) -> Result<Video> {
 }
 
 /// Where short link `url` leads: its redirect (`Location`), not followed
-/// but read as a link itself, which must be to a video.
-async fn resolve(url: &str) -> Result<VideoId> {
-    let response = cache::client(|_| false)
+/// (`client` follows none) but read as a link itself, which must be to a
+/// video.
+async fn resolve(client: &reqwest::Client, url: &str) -> Result<VideoId> {
+    let response = client
         .get(url)
         .header(USER_AGENT, cache::USER_AGENT)
         .timeout(WAIT)
@@ -258,6 +270,8 @@ mod tests {
             "",
             "hello",
             "open 7657182246486478098",
+            "2024",
+            "765718224648647809",
             "https://www.tiktok.com/",
             "https://www.tiktok.com/?_r=1",
             "https://www.tiktok.com/@someone",
@@ -396,13 +410,19 @@ mod tests {
             .unwrap();
         let id = page.videos[0].id.clone();
         let link = format!("https://www.tiktok.com/@someone/video/{}", id.as_str());
-        let video = fetch(&client, parse(&link).unwrap()).await.unwrap();
+        let short_client = cache::client(|_| false);
+        let video = fetch(&client, &short_client, parse(&link).unwrap())
+            .await
+            .unwrap();
         assert_eq!(video.id, id);
         assert!(video.token.is_some() && !video.renditions.is_empty());
         // A dead short link (yt-dlp's) leads to TikTok's home page: its
         // redirect is read, not followed.
         let dead = parse("https://vm.tiktok.com/ZTR45GpSF/").unwrap();
-        let why = fetch(&client, dead).await.unwrap_err().to_string();
+        let why = fetch(&client, &short_client, dead)
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             why,
             "the short link leads to no video (it may have expired, or be a photo post)"
