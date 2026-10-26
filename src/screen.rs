@@ -24,8 +24,9 @@ use crate::text;
 /// terminal does (`gone`).
 static STDERR_IS_IT: AtomicBool = AtomicBool::new(false);
 
-/// Why one of tuitok's tasks panicked, once one has: tuitok then quits as
-/// with q, and says it once the terminal is back (`main::ended`).
+/// Why one of tuitok's tasks panicked, once one has, with the backtrace
+/// `RUST_BACKTRACE` asks for: tuitok then quits as with q, and says it once
+/// the terminal is back (`main::ended`).
 static TASK_PANIC: OnceLock<String> = OnceLock::new();
 
 /// A plain error, before anything is started, when tuitok isn't run in a
@@ -83,7 +84,11 @@ fn set_panic_hook() {
             return;
         }
         if std::thread::current().name() != Some("main") {
-            let _ = TASK_PANIC.set(text::one_line(&info.to_string(), 400));
+            let why = text::one_line(&info.to_string(), 400);
+            let _ = TASK_PANIC.set(match captured_backtrace() {
+                Some(backtrace) => format!("{why}\n{backtrace}"),
+                None => why,
+            });
             // SAFETY: a plain signal to tuitok itself.
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
             return;
@@ -97,13 +102,18 @@ fn set_panic_hook() {
             "tuitok crashed: {}",
             text::one_line(&info.to_string(), 400)
         );
-        // As the default hook prints it: tuitok's own code's names and
-        // places, nothing from TikTok.
-        let backtrace = std::backtrace::Backtrace::capture();
-        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        if let Some(backtrace) = captured_backtrace() {
             let _ = writeln!(std::io::stderr(), "{backtrace}");
         }
     }));
+}
+
+/// The backtrace here, if `RUST_BACKTRACE` asks for one, as the default
+/// hook prints it: tuitok's own code's names and places, nothing from
+/// TikTok.
+fn captured_backtrace() -> Option<std::backtrace::Backtrace> {
+    let backtrace = std::backtrace::Backtrace::capture();
+    (backtrace.status() == std::backtrace::BacktraceStatus::Captured).then_some(backtrace)
 }
 
 /// Puts the terminal back as it was, each step on its own, so one that

@@ -1825,8 +1825,8 @@ impl App {
 
     fn on_event(&mut self, event: Event) {
         // Under the splash screen nothing's seen: a key or a paste takes it
-        // away and does nothing else, but quit (q, Ctrl-C). Once it fades,
-        // keys work.
+        // away and does nothing else, but quit (q, Esc, Ctrl-C, as with
+        // nothing open). Once it fades, keys work.
         if let Some(splash) = &mut self.splash
             && matches!(
                 &event,
@@ -1838,7 +1838,7 @@ impl App {
             && splash.leave(Instant::now())
         {
             if let Event::Key(key) = &event
-                && (key.code == KeyCode::Char('q') || ctrl_c(key))
+                && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c(key))
             {
                 self.quit = true;
             }
@@ -2186,14 +2186,13 @@ impl App {
 
     /// Space: pauses or plays the video shown. While what loads waits for
     /// you since the headphones went (`held`), it plays on: the video shown
-    /// loading too, or once it can load.
+    /// playing or loading, or once it can load. Played, not toggled: mpv
+    /// may not have said it paused yet, or ever, if a space's toggle comes
+    /// right after the unplug's pause, and `held` would stay.
     fn toggle_pause(&mut self) {
-        if self.shows_picture() {
+        if self.held.take().is_none() {
             self.with_player(Player::toggle_pause);
-            return;
-        }
-        if self.held.take().is_some()
-            && self.loads_shown()
+        } else if self.loads_shown()
             && let Some(player) = &self.player
         {
             player.play();
@@ -2898,6 +2897,11 @@ pub mod tests {
         app.pause_on_unplug = true;
         gone(&mut app);
         assert_eq!(app.held.as_deref(), Some("AirPods"));
+        // Space then plays on at once: mpv may never say it paused, if the
+        // space came right after the unplug's pause.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.held, None, "space plays on");
+        gone(&mut app);
         // Paused, then played by you (space, or mpv's window): nothing waits.
         app.on_player(PlayerEvent::Paused(true));
         app.on_player(PlayerEvent::Paused(false));
@@ -3426,11 +3430,13 @@ pub mod tests {
         pasted.keep_splash(Instant::now());
         pasted.on_event(Event::Paste("7657182246486478098".into()));
         assert_eq!(pasted.links_opened, 0);
-        // q quits.
-        let mut quitting = app_with(Vec::new());
-        quitting.keep_splash(Instant::now());
-        key(&mut quitting, 'q');
-        assert!(quitting.quit);
+        // q and Esc quit, as with nothing open.
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut quitting = app_with(Vec::new());
+            quitting.keep_splash(Instant::now());
+            quitting.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            assert!(quitting.quit, "{code:?}");
+        }
     }
 
     #[test]

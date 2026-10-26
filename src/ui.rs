@@ -1037,8 +1037,11 @@ fn status(app: &App) -> Line<'static> {
         Some(LinkState::Failed(why)) => return Line::from(why.clone()).fg(c.red),
         None => {}
     }
-    // The headphones went: what plays waits for you.
-    if let Some(name) = &app.held {
+    // The headphones went: what plays waits for you. With nothing shown
+    // yet, the feed's state is said (what comes first will wait).
+    if let Some(name) = &app.held
+        && app.current().is_some()
+    {
         return Line::from(format!(
             "Paused: “{name}” was disconnected · space plays on"
         ))
@@ -1184,6 +1187,19 @@ pub mod tests {
         // not how to quit.
         assert!(last.starts_with(" j k next/back  / category  : open  space pause  q quit"));
         assert!(last.contains("No browser for the feed"));
+        // The headphones gone with nothing shown: the feed's state is still
+        // said; with a video shown, that it waits.
+        app.held = Some("AirPods".into());
+        let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
+        assert!(last.contains("No browser for the feed"), "{last}");
+        let mut shown = crate::app::tests::app_with(vec![video("1")]);
+        shown.held = Some("AirPods".into());
+        let last = screen(&shown, 120, 40).lines().last().unwrap().to_owned();
+        assert!(
+            last.contains("Paused: “AirPods” was disconnected"),
+            "{last}"
+        );
+        app.held = None;
         app.feed = FeedState::Failed("x".into());
         let last = screen(&app, 120, 40).lines().last().unwrap().to_owned();
         assert!(last.starts_with(
