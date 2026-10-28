@@ -1534,6 +1534,7 @@ pub mod tests {
             &ratatui_image::picker::Picker::halfblocks(),
             &crate::demo::cover(0),
             (picture.width, picture.height),
+            None,
         )
         .unwrap();
         let cover = Cover::Ready {

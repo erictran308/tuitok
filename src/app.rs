@@ -421,10 +421,13 @@ pub struct App {
     token: Option<String>,
     placed: Option<Placed>,
     /// Covers by video, how the terminal draws pictures (none in tests),
-    /// and the client for TikTok's image hosts.
+    /// the client for TikTok's image hosts, and the numbers covers are sent
+    /// by with kitty's protocol, so the terminal can be told to delete the
+    /// ones dropped (`send_deletions`).
     pub covers: HashMap<VideoId, Cover>,
     picker: Option<Picker>,
     cover_client: Option<reqwest::Client>,
+    kitty: covers::KittyIds,
     /// Top comments by video, and the client for `www.tiktok.com`: its
     /// comment list, Explore's pages and a video's page; and the one that
     /// asks a short link where it leads, following no redirect.
@@ -524,6 +527,7 @@ impl App {
             covers: HashMap::new(),
             picker: None,
             cover_client: None,
+            kitty: covers::KittyIds::new(),
             comments: HashMap::new(),
             www_client: None,
             short_client: None,
@@ -565,9 +569,11 @@ impl App {
         while !self.quit {
             self.advance_splash(Instant::now());
             // A frame that can't be drawn ends tuitok as a quit does; when
-            // the tab was closed (the hangup not read yet), it is one.
-            let drawn = terminal
-                .draw(|frame| ui::draw(frame, self))
+            // the tab was closed (the hangup not read yet), it is one. The
+            // covers dropped are deleted first, ahead of any it sends.
+            let drawn = self
+                .send_deletions()
+                .and_then(|()| terminal.draw(|frame| ui::draw(frame, self)))
                 .and_then(|_| write_to_terminal(&self.placement()));
             if let Err(e) = drawn {
                 if !crate::screen::gone() {
@@ -599,6 +605,12 @@ impl App {
         // A tab that's gone has no box to take away; the player quits anyway.
         if let Some(placed) = self.placed.take() {
             let _ = write_to_terminal(&pepper::remove(&placed.token));
+        }
+        // The terminal would keep the covers after tuitok is gone: all of
+        // them go, unless writing to it failed.
+        self.covers.clear();
+        if result.is_ok() {
+            let _ = self.send_deletions();
         }
         if let Some(player) = self.player.take() {
             player.quit().await;
@@ -1811,8 +1823,9 @@ impl App {
                         picker.clone(),
                         picture.clone(),
                     );
+                    let kitty = self.kitty.next(&picker);
                     tokio::spawn(async move {
-                        let encoded = covers::encode(picker, picture, size)
+                        let encoded = covers::encode(picker, picture, size, kitty)
                             .await
                             .map_err(|e| format!("{e:#}"));
                         let _ = tx.send(AppEvent::CoverEncoded { id, encoded });
@@ -1821,6 +1834,20 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// Has a terminal speaking kitty's protocol delete the covers dropped
+    /// since it was last told (`covers::KittyIds`): before each frame, ahead
+    /// of any cover it sends, and all of them on the way out.
+    fn send_deletions(&mut self) -> io::Result<()> {
+        write_to_terminal(&self.deletions())
+    }
+
+    /// The code [`send_deletions`](Self::send_deletions) writes: nothing if
+    /// no cover was dropped, or the terminal keeps no pictures.
+    fn deletions(&mut self) -> String {
+        let tmux = self.picker.as_ref().is_some_and(Picker::tmux_detected);
+        self.kitty.deletions(tmux)
     }
 
     fn on_event(&mut self, event: Event) {
@@ -2318,7 +2345,8 @@ fn ctrl_c(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Writes tuitok's own sequences to the terminal, after ratatui's frame.
+/// Writes tuitok's own sequences to the terminal: kitty's deletions before
+/// ratatui's frame, Pepper's after it.
 fn write_to_terminal(text: &str) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -3524,5 +3552,75 @@ pub mod tests {
         paste(&mut demo, "7657182246486478098");
         let none = "The demo opens no links";
         assert_eq!(demo.link, Some(LinkState::Failed(none.into())));
+    }
+
+    /// `app` draws pictures as `picker` does, kitty's numbered from 1, with
+    /// a cover encoded for each of its first `n` videos.
+    fn with_covers(app: &mut App, picker: Picker, n: usize) {
+        app.picker = Some(picker);
+        app.kitty = covers::KittyIds::counting_from(0);
+        for at in 0..n {
+            let cover = Cover::Ready {
+                picture: Arc::new(DynamicImage::new_rgb8(90, 160)),
+                encoded: Some(encoded_cover(app)),
+                encoding: false,
+            };
+            app.covers.insert(app.videos[at].id.clone(), cover);
+        }
+    }
+
+    /// A cover encoded as `app` encodes them, with the next of its numbers.
+    fn encoded_cover(app: &mut App) -> Encoded {
+        let picker = app.picker.clone().unwrap();
+        let kitty = app.kitty.next(&picker);
+        let picture = DynamicImage::new_rgb8(90, 160);
+        covers::encode_now(&picker, &picture, (4, 2), kitty).unwrap()
+    }
+
+    /// What `app` writes to have the terminal delete the covers numbered
+    /// `ids`.
+    fn deleting(ids: &[u32]) -> String {
+        // Outside tmux, as the test's picker is.
+        ids.iter()
+            .map(|&id| covers::kitty_delete(id, false))
+            .collect()
+    }
+
+    #[test]
+    fn covers_dropped_are_deleted_from_a_kitty_terminal_by_the_numbers_they_were_sent_as() {
+        let videos = (1..=8).map(|n| crate::ui::tests::video(&n.to_string()));
+        let mut app = app_with(videos.collect());
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        with_covers(&mut app, picker, 4);
+        assert_eq!(app.deletions(), "", "nothing dropped yet");
+        // The first is pruned, more than `cache::BEHIND` before the one
+        // shown, which keeps its own.
+        app.go(3);
+        assert!(app.covers.contains_key(&app.current().unwrap().id));
+        assert_eq!(app.deletions(), deleting(&[1]));
+        assert_eq!(app.deletions(), "", "told once");
+        // The third, encoded again at another size: the one it replaces goes.
+        let id = app.videos[2].id.clone();
+        let encoded = Ok(encoded_cover(&mut app));
+        app.on_app_event(AppEvent::CoverEncoded { id, encoded });
+        assert_eq!(app.deletions(), deleting(&[3]));
+        // The second, which then couldn't be.
+        let id = app.videos[1].id.clone();
+        let encoded = Err("the picture couldn't be decoded".into());
+        app.on_app_event(AppEvent::CoverEncoded { id, encoded });
+        let cover = app.covers.get(&app.videos[1].id);
+        assert!(matches!(cover, Some(Cover::Failed)));
+        assert_eq!(app.deletions(), deleting(&[2]));
+    }
+
+    #[test]
+    fn terminals_that_keep_no_pictures_are_told_to_delete_none() {
+        let videos = (1..=8).map(|n| crate::ui::tests::video(&n.to_string()));
+        let mut app = app_with(videos.collect());
+        with_covers(&mut app, Picker::halfblocks(), 4);
+        app.go(3);
+        assert!(!app.covers.contains_key(&app.videos[0].id), "pruned");
+        assert_eq!(app.deletions(), "");
     }
 }
