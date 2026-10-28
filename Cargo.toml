@@ -1,6 +1,6 @@
 [package]
 name = "tuitok"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "TikTok's For You feed in your terminal, one video at a time, playing inside Pepper"
 license = "MIT"
